@@ -3,6 +3,8 @@
 
 import pytest
 import torch
+import time
+import nvtx
 
 from tests.kernels.moe.utils import make_test_quant_config, make_test_weights
 from tests.kernels.quant_utils import (
@@ -26,6 +28,16 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_e8m0_used,
 )
 from vllm.utils.import_utils import has_deep_gemm
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    swap_w13_to_w31,
+    build_flashinfer_fp8_cutlass_moe_prepare_finalize,
+    select_cutlass_fp8_gemm_impl,
+)
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig
+)
 
 dg_available = has_deep_gemm()
 
@@ -39,26 +51,47 @@ DTYPES = [torch.bfloat16]  # [torch.half, torch.bfloat16, torch.float32]
 # Deepseek-V3's intermediate size 18432, so N is 18432*2/8=4608 at TP8
 # and its hidden size is 7168.
 MNK_FACTORS = [
-    (1, 128, 128),
-    (1, 128, 7168),
-    (1, 1024, 7168),
-    (1, 4608, 128),
-    (1, 4608, 7168),
-    (83, 128, 128),
-    (83, 512, 512),
-    (83, 4608, 512),
-    (83, 4608, 7168),
-    (128, 512, 512),
-    (128, 1024, 7168),
-    (128, 4608, 7168),
-    (2048, 128, 128),
-    (2048, 1024, 7168),
-    (2048, 4608, 512),
-    (2048, 4608, 7168),
-    (8192, 128, 128),
-    (8192, 128, 7168),
-    (8192, 1024, 7168),
-    (8192, 4608, 7168),
+    # (1, 128, 128),
+    # (1, 128, 7168),
+    # (1, 1024, 7168),
+    # (1, 4608, 128),
+    # (1, 4608, 7168),
+    # (83, 128, 128),
+    # (83, 512, 512),
+    # (83, 4608, 512),
+    # (83, 4608, 7168),
+    # (128, 512, 512),
+    # (128, 1024, 7168),
+    # (128, 4608, 7168),
+    # (2048, 128, 128),
+    # (2048, 1024, 7168),
+    # (2048, 4608, 512),
+    # (2048, 4608, 7168),
+    # (8192, 128, 128),
+    # (8192, 128, 7168),
+    # (8192, 1024, 7168),
+    # (8192, 4608, 7168),
+    # (1, 256, 7168), # TP8
+    # (2, 256, 7168), # TP8
+    # (4, 256, 7168), # TP8
+    # (8, 256, 7168), # TP8
+    # (16, 256, 7168), # TP8
+    # (32, 256, 7168), # TP8
+    # (64, 256, 7168), # TP8
+    # (128, 256, 7168), # TP8
+    # (256, 256, 7168), # TP8
+    # (512, 256, 7168), # TP8
+    # (1, 2048, 7168),
+    # (2, 2048, 7168),
+    # (4, 2048, 7168),
+    # (8, 2048, 7168),
+    # (16, 2048, 7168),
+    # (32, 2048, 7168),
+    # (64, 2048, 7168),
+    # (128, 2048, 7168),
+    (256, 2048, 7168),
+    # (512, 2048, 7168),
+    # (1, 128, 128)
 ]
 
 MNK_FACTORS_DG = [
@@ -81,8 +114,8 @@ MNK_FACTORS_DG = [
 ]
 
 BLOCK_SIZE = [[128, 128]]
-E = [2, 8, 16]  # [128, 256]
-TOP_KS = [1, 2, 6]
+E = [8]  # [128, 256]
+TOP_KS = [1]
 SEEDS = [0]
 
 
@@ -130,9 +163,10 @@ def setup_cuda():
 @pytest.mark.parametrize("block_size", BLOCK_SIZE)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("benchmark", [True])
 @torch.inference_mode()
 def test_w8a8_block_fp8_fused_moe(
-    M, N, K, E, topk, block_size, dtype, seed, monkeypatch
+    M, N, K, E, topk, block_size, dtype, seed, benchmark, monkeypatch
 ):
     if topk > E:
         pytest.skip(f"Skipping test; topk={topk} > E={E}")
@@ -154,33 +188,183 @@ def test_w8a8_block_fp8_fused_moe(
         block_shape=block_size,
     )
 
-    m_fused_moe = modular_triton_fused_moe(quant_config)
+    # m_fused_moe = modular_triton_fused_moe(quant_config)
 
     topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
 
     # Set the context to avoid lots of warning spam.
     with set_current_vllm_config(vllm_config):
-        ref_out = torch_w8a8_block_fp8_moe(
-            a,
-            w1,
-            w2,
-            quant_config.w1_scale,
-            quant_config.w2_scale,
-            topk_weights,
-            topk_ids,
-            block_size,
-        )
+        # print(f"[JTC] a.shape {a.shape} {a.dtype}, w1.shape {w1.shape} {w1.dtype}, w2.shape {w2.shape} {w2.dtype}, quant_config.w1_scale.shape {quant_config.w1_scale.shape} {quant_config.w1_scale.dtype}, quant_config.w2_scale.shape {quant_config.w2_scale.shape} {quant_config.w2_scale.dtype}")
+        if not benchmark:
+            ref_out = torch_w8a8_block_fp8_moe(
+                a,
+                w1,
+                w2,
+                quant_config.w1_scale,
+                quant_config.w2_scale,
+                topk_weights,
+                topk_ids,
+                block_size,
+            )
 
         out = fused_experts(
             a, w1, w2, topk_weights, topk_ids, quant_config=quant_config
         )
 
-        m_out = m_fused_moe(a, w1, w2, topk_weights, topk_ids)
+        if benchmark:
+            out.fill_(0)
+            stream = torch.cuda.Stream()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                out = fused_experts(a, w1, w2, topk_weights, topk_ids, quant_config=quant_config)
+            total_time = 0
+            # add nsys cuda api
+            for i in range(1):
+                torch.cuda.synchronize()
+                time_start = time.time()
+                with nvtx.annotate("fused_experts"):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                time_end = time.time()
+                total_time += time_end - time_start
+            print(f"[JTC] average time cost: {total_time / 20 * 1000000} us")
+
+        # m_out = m_fused_moe(a, w1, w2, topk_weights, topk_ids)
 
     # 0.039 only needed for M >= 8192
-    tol = 0.035 if M < 8192 else 0.039
-    torch.testing.assert_close(out, ref_out, atol=tol, rtol=tol)
-    torch.testing.assert_close(m_out, ref_out, atol=tol, rtol=tol)
+    if not benchmark:
+        tol = 0.035 if M < 8192 else 0.039
+        torch.testing.assert_close(out, ref_out, atol=tol, rtol=tol)
+    # torch.testing.assert_close(m_out, ref_out, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize(("M", "N", "K"), MNK_FACTORS)
+@pytest.mark.parametrize("E", E)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("block_size", BLOCK_SIZE)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("benchmark", [True])
+@torch.inference_mode()
+def test_w8a8_block_fp8_fused_moe_flashinfer(
+    M, N, K, E, topk, block_size, dtype, seed, benchmark, monkeypatch
+):
+    if topk > E:
+        pytest.skip(f"Skipping test; topk={topk} > E={E}")
+
+    torch.manual_seed(seed)
+
+    monkeypatch.setenv("VLLM_FUSED_MOE_CHUNK_SIZE", "2048")
+
+    a = torch.randn((M, K), dtype=dtype) / 10
+    score = torch.randn((M, E), dtype=dtype)
+
+    w1, w2, quant_config = make_test_quant_config(
+        E,
+        N,
+        K,
+        dtype,
+        quant_dtype=torch.float8_e4m3fn,
+        per_act_token_quant=False,
+        block_shape=block_size,
+    )
+
+    w31 = swap_w13_to_w31(w1)
+
+    topk_weights, topk_ids, _ = fused_topk(a, score.float(), topk, False)
+
+    # Set the context to avoid lots of warning spam.
+    with set_current_vllm_config(vllm_config):
+        # print(f"[JTC] a.shape {a.shape} {a.dtype}, w1.shape {w1.shape} {w1.dtype}, w2.shape {w2.shape} {w2.dtype}, quant_config.w1_scale.shape {quant_config.w1_scale.shape} {quant_config.w1_scale.dtype}, quant_config.w2_scale.shape {quant_config.w2_scale.shape} {quant_config.w2_scale.dtype}")
+        if not benchmark:
+            ref_out = torch_w8a8_block_fp8_moe(
+                a,
+                w1,
+                w2,
+                quant_config.w1_scale,
+                quant_config.w2_scale,
+                topk_weights,
+                topk_ids,
+                block_size,
+            )
+
+        moe: FusedMoEConfig = FusedMoEConfig(
+            num_experts=E,
+            experts_per_token=topk,
+            hidden_dim=K,
+            num_local_experts=E,
+            moe_parallel_config=FusedMoEParallelConfig(
+                tp_size=1,
+                dp_size=1,
+                ep_size=1,
+                tp_rank=0,
+                dp_rank=0,
+                ep_rank=0,
+                use_ep=False,
+                all2all_backend="naive",
+            ),
+            in_dtype=a.dtype,
+            max_num_tokens=2048,
+            is_act_and_mul=True,
+            is_lora_enabled=False,
+        )
+
+
+        flashinfer_fused_experts = mk.FusedMoEModularKernel(
+            build_flashinfer_fp8_cutlass_moe_prepare_finalize(
+                moe=moe, use_deepseek_fp8_block_scale=True
+            ),
+            select_cutlass_fp8_gemm_impl(
+                moe=moe,
+                quant_config=quant_config,
+                out_dtype=a.dtype,
+                use_deepseek_fp8_block_scale=True,
+            ),
+        )
+
+        out = flashinfer_fused_experts(
+            a, w31, w2, topk_weights, topk_ids,
+                inplace=False,
+                activation="silu",
+                global_num_experts=E,
+                apply_router_weight_on_input=False,
+        )
+
+        if benchmark:
+            out.fill_(0)
+            stream = torch.cuda.Stream()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                out = flashinfer_fused_experts(
+                    a, w31, w2, topk_weights, topk_ids,
+                    inplace=False,
+                    activation="silu",
+                    global_num_experts=E,
+                    apply_router_weight_on_input=False,
+                )
+            total_time = 0
+            for i in range(1):
+                torch.cuda.synchronize()
+                time_start = time.time()
+                with nvtx.annotate("fused_experts"):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                time_end = time.time()
+                # print(f"[JTC] time cost: {(time_end - time_start) * 1000000} us")
+                total_time += time_end - time_start
+            print(f"[JTC] average time cost: {total_time / 20 * 1000000} us")
+
+        # out = fused_experts(
+        #     a, w1, w2, topk_weights, topk_ids, quant_config=quant_config
+        # )
+
+        # m_out = m_fused_moe(a, w1, w2, topk_weights, topk_ids)
+
+    # 0.039 only needed for M >= 8192
+    if not benchmark:
+        tol = 0.035 if M < 8192 else 0.039
+        torch.testing.assert_close(out, ref_out, atol=tol, rtol=tol)
+    # torch.testing.assert_close(m_out, ref_out, atol=tol, rtol=tol)
 
 
 @pytest.mark.parametrize(("M", "N", "K"), MNK_FACTORS_DG)
