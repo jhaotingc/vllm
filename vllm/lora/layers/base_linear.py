@@ -38,11 +38,6 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         lora_config: LoRAConfig,
         model_config: PretrainedConfig | None = None,
     ) -> None:
-        # Warmup: trigger Triton JIT compilation for CUDA graph capture
-        self.lora_ready = torch.zeros(1, dtype=torch.int8, device=self.device)
-        self.lora_ready.fill_(1)
-        self._sync_lora_loads()
-        self.lora_ready.fill_(0)
 
         self.lora_config = lora_config
         if isinstance(self.base_layer, ReplicatedLinear):

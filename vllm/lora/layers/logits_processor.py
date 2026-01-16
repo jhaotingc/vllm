@@ -88,11 +88,6 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         lora_config: LoRAConfig,
         model_config: PretrainedConfig | None = None,
     ) -> None:
-        # Warmup: trigger Triton JIT for load syncing compilation for CUDA graph capture
-        self.lora_ready = torch.zeros(1, dtype=torch.int8, device=self.device)
-        self.lora_ready.fill_(1)
-        self._sync_lora_loads()
-        self.lora_ready.fill_(0)
 
         # TODO: Verify if this condition can be further relaxed
         if 32000 < self.base_layer.vocab_size > 257024:
@@ -191,8 +186,6 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
         return logits
 
     def forward(self, *args, **kwargs):
-        # synchronizing lora load
-        self._sync_lora_loads()
         return type(self.base_layer).forward(self, *args, **kwargs)
 
     @classmethod

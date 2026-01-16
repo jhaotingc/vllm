@@ -254,27 +254,18 @@ class LoRAModelManager:
             "Activating LoRA. int id: %d, slot index: %d", lora_model.id, index
         )
         self.lora_index_to_id[index] = lora_model.id
+
+        lora_modules = []
         for module_name, module in self.modules.items():
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
-            if module.lora_ready is not None:
-                module.lora_ready.fill_(0)
             if not module_lora:
                 module.reset_lora(index)
                 continue
+            lora_modules.append((module, module_lora))
 
-        for module_name, module in self.modules.items():
-            module_lora = self._get_lora_layer_weights(lora_model, module_name)
-            if not module_lora:
-                continue
-            with torch.cuda.stream(self.lora_loading_stream):
-                module.set_lora(
-                    index,
-                    module_lora.lora_a,
-                    module_lora.lora_b,
-                )
-                # will need to update for multi-lora request loading
-                if module.lora_ready is not None:
-                    module.lora_ready.fill_(1)
+        with torch.cuda.stream(self.lora_loading_stream):
+            for module, module_lora in lora_modules:
+                module.set_lora(index, module_lora.lora_a, module_lora.lora_b)
         return True
 
     def _deactivate_adapter(self, lora_id: int):

@@ -150,7 +150,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 moe_state_dict["apply_router_weight_on_input"] = kwargs[
                     "apply_router_weight_on_input"
                 ]
-                self._sync_lora_loads()
                 result = func(*args, **kwargs)
                 return result
 
@@ -384,12 +383,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.max_loras = lora_config.max_loras
         self.fully_sharded = lora_config.fully_sharded_loras
 
-        self.lora_ready = torch.zeros(1, dtype=torch.int8, device=self.device)
-        # Warmup: trigger Triton JIT compilation for CUDA graph capture
-        self.lora_ready.fill_(1)
-        self._sync_lora_loads()
-        self.lora_ready.fill_(0)
-
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device
         )
@@ -516,7 +509,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_b_stacked[0][index].copy_(w2_lora_b, non_blocking=True)
 
     def forward(self, *args, **kwargs):
-        # self._sync_lora_loads()
         return self.base_layer.forward(*args, **kwargs)
 
     def maybe_all_reduce_tensor_model_parallel(self, *args, **kwargs):
@@ -594,12 +586,6 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         self._base_model = model_config.architectures[0]
         self.max_loras = lora_config.max_loras
         self.fully_sharded = lora_config.fully_sharded_loras
-
-        # Warmup: trigger Triton JIT compilation for CUDA graph capture
-        self.lora_ready = torch.zeros(1, dtype=torch.int8, device=self.device)
-        self.lora_ready.fill_(1)
-        self._sync_lora_loads()
-        self.lora_ready.fill_(0)
 
         self.adapter_enabled = torch.tensor(
             [0] * (max_loras + 1), dtype=torch.int, device=self.device

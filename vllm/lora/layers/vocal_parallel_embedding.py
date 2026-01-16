@@ -27,11 +27,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         lora_config: LoRAConfig,
         model_config: PretrainedConfig | None = None,
     ) -> None:
-        # Warmup: trigger Triton JIT for load syncing compilation for CUDA graph capture
-        self.lora_ready = torch.zeros(1, dtype=torch.int8, device=self.device)
-        self.lora_ready.fill_(1)
-        self._sync_lora_loads()
-        self.lora_ready.fill_(0)
 
         if self.base_layer.num_added_embeddings_per_partition > 0:
             # We can start adding lora weights
@@ -86,9 +81,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         lora_a: torch.Tensor | list[torch.Tensor],
         lora_b: torch.Tensor | list[torch.Tensor],
     ):
-        assert isinstance(lora_a, torch.Tensor)
-        assert isinstance(lora_b, torch.Tensor)
-        self.reset_lora(index)
+        # assert isinstance(lora_a, torch.Tensor)
+        # assert isinstance(lora_b, torch.Tensor)
+        # self.reset_lora(index)
         # NOTE self.lora_a_stacked is row-major, and lora_a is col-major,
         # so we need transpose here
 
@@ -98,12 +93,12 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.lora_b_stacked[index, 0, : lora_b.shape[0], : lora_b.shape[1]].copy_(
             lora_b, non_blocking=True
         )
+        self.set_lora_event.record()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # synchronizing lora load
-        self._sync_lora_loads()
         # NB: Don't use torch.narrow here. torch.narrow triggers some
         # Dynamic Shape specialization in torch.compile
+        torch.cuda.current_stream().wait_event(self.set_lora_event)
         num_tokens = x.shape[0]
         indices_1 = self.punica_wrapper._embeddings_indices[1][:num_tokens]
 
