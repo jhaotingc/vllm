@@ -1901,7 +1901,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
-        return False
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
@@ -1935,7 +1935,10 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
     @staticmethod
     def _supports_activation(activation: str) -> bool:
-        return activation in ["silu", "gelu", "swigluoai", "swiglustep"]
+        return activation in [
+            "silu", "gelu", "swigluoai", "swiglustep",
+            "silu_no_mul", "gelu_no_mul", "relu2_no_mul",
+        ]
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
