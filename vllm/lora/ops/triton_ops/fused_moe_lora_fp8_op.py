@@ -343,7 +343,7 @@ def _fused_moe_lora_fp8_kernel(
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 if use_fp8_w8a8:
-                    accumulator += tl.dot(a, b, acc=accumulator)
+                    accumulator = tl.dot(a, b, acc=accumulator)
                 else:
                     accumulator += tl.dot(a, b)
         else:
