@@ -13,6 +13,7 @@ from vllm.distributed import (
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .fused_moe_lora_op import fill_zeros
 from .utils import supports_pdl
 
 
@@ -766,13 +767,13 @@ def _fused_moe_lora_fp8(
         else num_tokens * shrink_block_size_m
     )
 
-    a_intermediate_cache1 = torch.zeros(
+    a_intermediate_cache1 = torch.empty(
         (num_slices, M, top_k_num, max_lora_rank),
         dtype=output.dtype,
         device=device,
     )
-
     use_gdc = supports_pdl(device) and not fully_sharded
+    fill_zeros(a_intermediate_cache1, use_gdc=use_gdc)
     _fused_moe_lora_shrink_fp8(
         a_intermediate_cache1,
         qcurr_hidden_states,

@@ -70,6 +70,31 @@ def _get_token_offs(
         )
 
 
+@triton.jit
+def _fill_zeros_kernel(
+    ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    zero = tl.zeros((BLOCK_SIZE,), dtype=ptr.dtype.element_ty)
+    tl.store(ptr + offs, zero, mask=mask)
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def fill_zeros(t: torch.Tensor, use_gdc: bool = False) -> None:
+    n = t.numel()
+    grid = (triton.cdiv(n, 1024),)
+    _fill_zeros_kernel[grid](
+        t, n, BLOCK_SIZE=1024, USE_GDC=use_gdc, launch_pdl=use_gdc,
+    )
+
+
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
 
 
@@ -319,6 +344,8 @@ def _fused_moe_lora_kernel(
         else:
             tl.store(c_ptrs, accumulator, mask=c_mask)
     else:
+        if USE_GDC and IS_PRIMARY:
+            tl.extra.cuda.gdc_wait()
         tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
 
 
@@ -616,13 +643,13 @@ def _fused_moe_lora(
         else num_tokens * shrink_block_size_m
     )
 
-    a_intermediate_cache1 = torch.zeros(
+    a_intermediate_cache1 = torch.empty(
         (num_slices, M, top_k_num, max_lora_rank),
         dtype=output.dtype,
         device=device,
     )
-
     use_gdc = supports_pdl(device) and not fully_sharded
+    fill_zeros(a_intermediate_cache1, use_gdc=use_gdc)
     _fused_moe_lora_shrink(
         a_intermediate_cache1,
         qcurr_hidden_states,
