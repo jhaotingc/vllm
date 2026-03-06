@@ -245,6 +245,7 @@ if TYPE_CHECKING:
     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_SPEC_DECODE_FIXED_ACCEPTANCE_LENGTH: int = 0
 
 
 def get_default_cache_root():
@@ -1631,6 +1632,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scaling command in elastic EP.
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
+    ),
+    # Debug: fix spec decode acceptance length to a constant value.
+    # 0 = normal rejection sampling, >0 = accept exactly N draft tokens
+    # (clamped to actual num drafts). Only meaningful for eagle/eagle3.
+    "VLLM_SPEC_DECODE_FIXED_ACCEPTANCE_LENGTH": lambda: int(
+        os.getenv("VLLM_SPEC_DECODE_FIXED_ACCEPTANCE_LENGTH", "0")
     ),
 }
 

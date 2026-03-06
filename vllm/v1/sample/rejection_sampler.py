@@ -7,6 +7,7 @@ from dataclasses import replace
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -368,6 +369,8 @@ def rejection_sample(
     assert cu_num_draft_tokens.ndim == 1
     assert target_logits.ndim == 2
 
+    fixed_len: int = envs.VLLM_SPEC_DECODE_FIXED_ACCEPTANCE_LENGTH
+
     batch_size = len(num_draft_tokens)
     num_tokens = draft_token_ids.shape[0]
     vocab_size = target_logits.shape[-1]
@@ -400,6 +403,7 @@ def rejection_sample(
             bonus_token_ids,
             is_greedy,
             max_spec_len,
+            FIXED_ACCEPTANCE_LENGTH=fixed_len,
         )
         if sampling_metadata.all_greedy:
             return output_token_ids
@@ -444,6 +448,7 @@ def rejection_sample(
         max_spec_len,
         vocab_size,
         NO_DRAFT_PROBS=draft_probs is None,
+        FIXED_ACCEPTANCE_LENGTH=fixed_len,
     )
     return output_token_ids
 
@@ -658,6 +663,7 @@ def rejection_greedy_sample_kernel(
     bonus_token_ids_ptr,  # [batch_size]
     is_greedy_ptr,  # [batch_size] or None
     max_spec_len,
+    FIXED_ACCEPTANCE_LENGTH: tl.constexpr = 0,
 ):
     req_idx = tl.program_id(0)
     # FIXME(woosuk): Because is_greedy_ptr is not None at profiling run,
@@ -671,6 +677,7 @@ def rejection_greedy_sample_kernel(
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
 
+    num_accepted = 0
     rejected = False
     for pos in range(num_draft_tokens):
         if not rejected:
@@ -680,15 +687,26 @@ def rejection_greedy_sample_kernel(
                 output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
                 target_argmax_id,
             )
-            if draft_token_id != target_argmax_id:
-                # Reject.
-                rejected = True
+            num_accepted += 1
+            if FIXED_ACCEPTANCE_LENGTH > 0:
+                if num_accepted >= FIXED_ACCEPTANCE_LENGTH:
+                    rejected = True
+            else:
+                if draft_token_id != target_argmax_id:
+                    rejected = True
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         tl.store(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
+            bonus_token_id,
+        )
+    elif FIXED_ACCEPTANCE_LENGTH > 0 and num_accepted <= num_draft_tokens:
+        # In fixed-acceptance mode, write bonus token after the accepted drafts.
+        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        tl.store(
+            output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_accepted,
             bonus_token_id,
         )
 
@@ -708,6 +726,7 @@ def rejection_random_sample_kernel(
     max_spec_len,
     vocab_size,
     NO_DRAFT_PROBS: tl.constexpr,
+    FIXED_ACCEPTANCE_LENGTH: tl.constexpr = 0,
 ):
     req_idx = tl.program_id(0)
     is_greedy = tl.load(is_greedy_ptr + req_idx)
@@ -719,31 +738,39 @@ def rejection_random_sample_kernel(
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
 
+    num_accepted = 0
     rejected = False
     for pos in range(num_draft_tokens):
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            if NO_DRAFT_PROBS:
-                draft_prob = 1
-            else:
-                draft_prob = tl.load(
-                    draft_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
-                )
-            target_prob = tl.load(
-                target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
-            )
-            uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
-            # NOTE(woosuk): While the draft probability should never be 0,
-            # we check it to avoid NaNs. If it happens to be 0, we reject.
-            if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
-                # Accept.
+            if FIXED_ACCEPTANCE_LENGTH > 0:
+                # Force-accept the draft token.
                 token_id = draft_token_id
+                num_accepted += 1
+                if num_accepted >= FIXED_ACCEPTANCE_LENGTH:
+                    rejected = True
             else:
-                # Reject. Use recovered token.
-                rejected = True
-                token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
+                if NO_DRAFT_PROBS:
+                    draft_prob = 1
+                else:
+                    draft_prob = tl.load(
+                        draft_probs_ptr + (start_idx + pos) * vocab_size
+                        + draft_token_id
+                    )
+                target_prob = tl.load(
+                    target_probs_ptr + (start_idx + pos) * vocab_size
+                    + draft_token_id
+                )
+                uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+                if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
+                    token_id = draft_token_id
+                else:
+                    rejected = True
+                    token_id = tl.load(
+                        recovered_token_ids_ptr + start_idx + pos)
             tl.store(
-                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                token_id,
             )
 
     if not rejected:
@@ -751,6 +778,13 @@ def rejection_random_sample_kernel(
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         tl.store(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
+            bonus_token_id,
+        )
+    elif FIXED_ACCEPTANCE_LENGTH > 0 and num_accepted <= num_draft_tokens:
+        # In fixed-acceptance mode, write bonus token after the accepted drafts.
+        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        tl.store(
+            output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_accepted,
             bonus_token_id,
         )
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
 
@@ -13,6 +14,7 @@ def _rejection_sample_kernel(
     target_sampled_ptr,  # [num_draft_tokens + num_reqs]
     input_ids_ptr,  # [num_draft_tokens + num_reqs]
     cu_num_logits_ptr,  # [num_reqs + 1]
+    FIXED_ACCEPTANCE_LENGTH: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
@@ -24,17 +26,35 @@ def _rejection_sample_kernel(
     for i in range(num_tokens - 1):
         if not rejected:
             target_sampled = tl.load(target_sampled_ptr + start_idx + i)
-            draft_sampled = tl.load(input_ids_ptr + start_idx + i + 1)
             tl.store(sampled_ptr + req_idx * sampled_stride + i, target_sampled)
             num_sampled += 1
-            if target_sampled != draft_sampled:
-                rejected = True
+            if FIXED_ACCEPTANCE_LENGTH > 0:
+                if num_sampled >= FIXED_ACCEPTANCE_LENGTH:
+                    rejected = True
+            else:
+                draft_sampled = tl.load(input_ids_ptr + start_idx + i + 1)
+                if target_sampled != draft_sampled:
+                    rejected = True
+
     if not rejected:
         target_sampled = tl.load(target_sampled_ptr + start_idx + num_tokens - 1)
         tl.store(
             sampled_ptr + req_idx * sampled_stride + num_tokens - 1, target_sampled
         )
         num_sampled += 1
+    elif FIXED_ACCEPTANCE_LENGTH > 0:
+        # In fixed-acceptance mode the loop stopped early; write the
+        # bonus / correction token at the next available position.
+        bonus_pos = num_sampled
+        if bonus_pos < num_tokens:
+            target_sampled = tl.load(
+                target_sampled_ptr + start_idx + bonus_pos)
+            tl.store(
+                sampled_ptr + req_idx * sampled_stride + bonus_pos,
+                target_sampled,
+            )
+            num_sampled += 1
+
     tl.store(num_sampled_ptr + req_idx, num_sampled)
 
 
@@ -47,6 +67,7 @@ def rejection_sample(
     cu_num_logits: torch.Tensor,
     num_speculative_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    fixed_len: int = envs.VLLM_SPEC_DECODE_FIXED_ACCEPTANCE_LENGTH
     num_reqs = cu_num_logits.shape[0] - 1
     sampled = torch.empty(
         num_reqs,
@@ -66,6 +87,7 @@ def rejection_sample(
         target_sampled,
         input_ids,
         cu_num_logits,
+        FIXED_ACCEPTANCE_LENGTH=fixed_len,
         num_warps=1,
     )
     return sampled, num_sampled
