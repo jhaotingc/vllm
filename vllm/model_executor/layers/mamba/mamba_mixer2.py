@@ -819,7 +819,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
-            if is_mamba_cache_all:
+            if is_mamba_cache_all and num_accepted_tokens is not None:
+                # "all" mode + MTP: metadata has separate input/output tensors.
+                # Input col 0 = last_computed block (where to read initial state)
+                # Output col 0 = last_scheduled block (where to write base state)
+                # Columns 1..N = scratch slots (same for both)
+                state_indices_tensor_d_input = state_indices_tensor_d
+                state_indices_tensor_d_output = (
+                    attn_metadata.state_indices_tensor_d_output
+                    if attn_metadata.state_indices_tensor_d_output is not None
+                    else state_indices_tensor_d
+                )
+            elif is_mamba_cache_all:
+                # "all" mode without MTP: gather single slots from block table
                 state_indices_tensor_d_input = state_indices_tensor_d.gather(
                     1, block_idx_last_computed_token_d.unsqueeze(1)
                 ).squeeze(1)
@@ -838,19 +850,62 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_output = state_indices_tensor_d
 
             # 2. Convolution sequence transformation
-            hidden_states_B_C_d = causal_conv1d_update(
-                hidden_states_B_C_d,
-                conv_state,
-                self.conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=state_indices_tensor_d,
-                block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
-                initial_state_idx=block_idx_last_computed_token_d,
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=query_start_loc_d,
-                max_query_len=state_indices_tensor_d.size(-1),
-            )
+            if is_mamba_cache_all and num_accepted_tokens is not None:
+                # MTP + "all" mode: conv1d uses initial_state_idx and
+                # block_idx_last_scheduled_token as COLUMN indices into
+                # conv_state_indices. The MTP-resolved tensor only has
+                # 1+num_spec columns, but those column indices point into
+                # the original block table (can be 8+). Build a 2-column
+                # tensor: col0=read_block_id, col1=write_block_id.
+                num_d = state_indices_tensor_d.shape[0]
+                conv_state_indices_for_conv = torch.stack([
+                    state_indices_tensor_d[:, 0],  # read: last_computed block
+                    (attn_metadata.state_indices_tensor_d_output[:, 0]
+                     if attn_metadata.state_indices_tensor_d_output is not None
+                     else state_indices_tensor_d[:, 0]),  # write: last_scheduled
+                ], dim=1)  # (num_decodes, 2)
+                conv_initial_state_idx = torch.zeros(
+                    num_d, dtype=torch.int32,
+                    device=state_indices_tensor_d.device)
+                conv_block_idx_last = torch.ones(
+                    num_d, dtype=torch.int32,
+                    device=state_indices_tensor_d.device)
+                # Per-block conv state has dconv-1+num_spec positions (6),
+                # matching IS_SPEC_DECODING state_len. Pass num_accepted_tokens
+                # so conv1d properly tracks acceptance offsets.
+                # (The 2-col indices fix handles the OOB column issue.)
+                # only has dconv (4) positions. This causes memory corruption
+                
+                
+                
+                
+                hidden_states_B_C_d = causal_conv1d_update(
+                    hidden_states_B_C_d,
+                    conv_state,
+                    self.conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=conv_state_indices_for_conv,
+                    block_idx_last_scheduled_token=conv_block_idx_last,
+                    initial_state_idx=conv_initial_state_idx,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=state_indices_tensor_d.size(-1),
+                )
+            else:
+                hidden_states_B_C_d = causal_conv1d_update(
+                    hidden_states_B_C_d,
+                    conv_state,
+                    self.conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=state_indices_tensor_d,
+                    block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
+                    initial_state_idx=block_idx_last_computed_token_d,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=state_indices_tensor_d.size(-1),
+                )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d

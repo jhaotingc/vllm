@@ -44,6 +44,7 @@ class BaseMambaAttentionMetadata:
     # speculative decoding compatibility, and will be None if the batch
     # has no decode requests.
     state_indices_tensor_d: torch.Tensor | None
+    state_indices_tensor_d_output: torch.Tensor | None  # for "all"+MTP: separate output indices
     query_start_loc_d: torch.Tensor | None  # shape: [num_decodes + 1,]
 
     # Number of accepted tokens for each spec sequence (for loading correct checkpoint)
@@ -111,13 +112,15 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 self.vllm_config.model_config.max_model_len,
                 self.kv_cache_spec.block_size,
             )
-            # Speculative decoding not supported with prefix caching,
-            # so keep shape consistent with prefill buffer
-            # TODO: reduce this size as needed for decode-only cudagraph capture
+            # For decode with MTP, we need (batch, 1 + num_spec_tokens)
+            # shaped indices. For non-MTP decode, we need (batch, max_num_blocks).
+            # Allocate the max of both to handle either case.
+            decode_state_cols = max(max_num_blocks,
+                                    1 + self.num_spec_tokens)
             self.state_indices_tensor_d: torch.Tensor = torch.empty(
                 (
                     self.decode_cudagraph_max_bs,
-                    max_num_blocks,
+                    decode_state_cols,
                 ),
                 dtype=torch.int32,
                 device=device,
@@ -410,11 +413,62 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             [num_decodes, num_prefills],
             dim=0,
         )
+        state_indices_tensor_d_output = None  # only set for "all" + MTP
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
             state_indices_tensor_d = state_indices_tensor_d[
                 :, : 1 + self.num_spec_tokens
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
+        elif self.use_spec_decode and num_decodes > 0:
+            # "all" mode + MTP: construct SEPARATE input and output index tensors.
+            # Input col 0 = last_computed (where to READ initial state from)
+            # Output col 0 = last_scheduled (where to WRITE base token state to)
+            # Columns 1..N = scratch slot IDs (same for both input and output)
+            assert block_idx_last_scheduled_token is not None
+            assert block_idx_last_computed_token is not None
+            num_gpu_blocks = self.vllm_config.cache_config.num_gpu_blocks
+            assert num_gpu_blocks is not None, (
+                "num_gpu_blocks not set -- cache not initialized yet"
+            )
+            # Input column 0: last_computed checkpoint (where state currently is)
+            input_base = state_indices_tensor_d.gather(
+                1,
+                block_idx_last_computed_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                ),
+            )  # (num_decodes, 1)
+            # Output column 0: last_scheduled checkpoint (where to write new state)
+            output_base = state_indices_tensor_d.gather(
+                1,
+                block_idx_last_scheduled_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                ),
+            )  # (num_decodes, 1)
+            # Columns 1..N: arithmetic scratch IDs (same for input and output)
+            batch_indices = torch.arange(
+                num_decodes,
+                device=state_indices_tensor_d.device,
+                dtype=torch.int32,
+            )
+            spec_offsets = torch.arange(
+                self.num_spec_tokens,
+                device=state_indices_tensor_d.device,
+                dtype=torch.int32,
+            )
+            scratch_slots = (
+                num_gpu_blocks
+                + batch_indices.unsqueeze(1) * self.num_spec_tokens
+                + spec_offsets.unsqueeze(0)
+            )  # (num_decodes, num_spec_tokens)
+            # Input: read from last_computed + scratch
+            state_indices_tensor_d = torch.cat(
+                [input_base.to(torch.int32), scratch_slots], dim=1
+            )  # (num_decodes, 1 + num_spec_tokens)
+            # Output: write to last_scheduled + scratch
+            state_indices_tensor_d_output = torch.cat(
+                [output_base.to(torch.int32), scratch_slots], dim=1
+            )  # (num_decodes, 1 + num_spec_tokens)
+            # Prefill keeps full block table shape (unchanged)
 
         # Sometimes even with specdec enabled we get single-token prefill chunks that
         # should be treated as decodes but don't have num_accepted_tokens set.
@@ -466,6 +520,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             has_initial_states_p=has_initial_states_p,
             state_indices_tensor_p=state_indices_tensor_p,
             state_indices_tensor_d=state_indices_tensor_d,
+            state_indices_tensor_d_output=state_indices_tensor_d_output,
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
@@ -490,6 +545,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
         state_indices_tensor_d = metadata.state_indices_tensor_d
+        state_indices_tensor_d_output = metadata.state_indices_tensor_d_output
         query_start_loc_d = metadata.query_start_loc_d
         num_accepted_tokens = metadata.num_accepted_tokens
         block_idx_last_scheduled_token = metadata.block_idx_last_scheduled_token
@@ -539,6 +595,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
+            state_indices_tensor_d_output=state_indices_tensor_d_output,
             query_start_loc_d=query_start_loc_d,
             num_accepted_tokens=num_accepted_tokens,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
@@ -574,11 +631,62 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             [metadata.num_decodes, metadata.num_prefills],
             dim=0,
         )
+        state_indices_tensor_d_output = None  # only set for "all" + MTP
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
             state_indices_tensor_d = state_indices_tensor_d[
                 :, : 1 + self.num_spec_tokens
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
+        elif self.use_spec_decode and num_decodes > 0:
+            # "all" mode + MTP: construct SEPARATE input and output index tensors.
+            # Input col 0 = last_computed (where to READ initial state from)
+            # Output col 0 = last_scheduled (where to WRITE base token state to)
+            # Columns 1..N = scratch slot IDs (same for both input and output)
+            assert block_idx_last_scheduled_token is not None
+            assert block_idx_last_computed_token is not None
+            num_gpu_blocks = self.vllm_config.cache_config.num_gpu_blocks
+            assert num_gpu_blocks is not None, (
+                "num_gpu_blocks not set -- cache not initialized yet"
+            )
+            # Input column 0: last_computed checkpoint (where state currently is)
+            input_base = state_indices_tensor_d.gather(
+                1,
+                block_idx_last_computed_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                ),
+            )  # (num_decodes, 1)
+            # Output column 0: last_scheduled checkpoint (where to write new state)
+            output_base = state_indices_tensor_d.gather(
+                1,
+                block_idx_last_scheduled_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                ),
+            )  # (num_decodes, 1)
+            # Columns 1..N: arithmetic scratch IDs (same for input and output)
+            batch_indices = torch.arange(
+                num_decodes,
+                device=state_indices_tensor_d.device,
+                dtype=torch.int32,
+            )
+            spec_offsets = torch.arange(
+                self.num_spec_tokens,
+                device=state_indices_tensor_d.device,
+                dtype=torch.int32,
+            )
+            scratch_slots = (
+                num_gpu_blocks
+                + batch_indices.unsqueeze(1) * self.num_spec_tokens
+                + spec_offsets.unsqueeze(0)
+            )  # (num_decodes, num_spec_tokens)
+            # Input: read from last_computed + scratch
+            state_indices_tensor_d = torch.cat(
+                [input_base.to(torch.int32), scratch_slots], dim=1
+            )  # (num_decodes, 1 + num_spec_tokens)
+            # Output: write to last_scheduled + scratch
+            state_indices_tensor_d_output = torch.cat(
+                [output_base.to(torch.int32), scratch_slots], dim=1
+            )  # (num_decodes, 1 + num_spec_tokens)
+            # Prefill keeps full block table shape (unchanged)
 
         new_metadata = replace(
             metadata,

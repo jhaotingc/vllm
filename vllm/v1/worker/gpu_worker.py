@@ -519,6 +519,33 @@ class Worker(WorkerBase):
         # so that it's available to the warmup stage.
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
+        # For Mamba "all" mode + MTP: extend the cache with scratch slots
+        # for speculative decode states. These slots live outside the block
+        # pool (IDs >= num_gpu_blocks) and are indexed arithmetically by
+        # the metadata builder.
+        if (self.cache_config.mamba_cache_mode == "all"
+                and self.vllm_config.speculative_config is not None
+                and self.vllm_config.speculative_config.num_speculative_tokens > 0):
+            num_spec = self.vllm_config.speculative_config.num_speculative_tokens
+            max_batch = self.vllm_config.scheduler_config.max_num_seqs
+            num_scratch = max_batch * num_spec
+            kv_cache_config.num_blocks += num_scratch
+            # Also extend the raw tensor sizes so allocation is big enough
+            for tensor_spec in kv_cache_config.kv_cache_tensors:
+                # Each tensor's size = page_size * num_blocks (original).
+                # We need to add page_size * num_scratch bytes.
+                page_size = tensor_spec.size // (kv_cache_config.num_blocks - num_scratch)
+                tensor_spec.size += page_size * num_scratch
+            logger.info(
+                "Mamba MTP scratch slots: extended cache by %d blocks "
+                "(max_batch=%d * num_spec=%d) for speculative states. "
+                "Block pool manages [0, %d), scratch uses [%d, %d).",
+                num_scratch, max_batch, num_spec,
+                self.cache_config.num_gpu_blocks,
+                self.cache_config.num_gpu_blocks,
+                self.cache_config.num_gpu_blocks + num_scratch,
+            )
+
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
