@@ -97,7 +97,7 @@ class Gemma4Config(VerifyAndUpdateConfig):
                 AttentionBackendEnum,
             )
 
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            vllm_config.attention_config.backend = AttentionBackendEnum.FLASHINFER
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
                 "(head_dim=%d, global_head_dim=%d). Forcing TRITON_ATTN "
