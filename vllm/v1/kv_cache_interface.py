@@ -352,7 +352,10 @@ class MambaSpec(KVCacheSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":
             max_model_len = vllm_config.model_config.max_model_len
-            return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+            num_blocks = cdiv(max_model_len, self.block_size)
+            # Add spec blocks for MTP speculative decoding
+            num_blocks += self.num_speculative_blocks
+            return num_blocks * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:

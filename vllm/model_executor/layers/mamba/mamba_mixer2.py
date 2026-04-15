@@ -819,30 +819,42 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Process decode requests
         if has_decode:
+            # Default conv1d parameters (overridden for MTP+all mode)
+            _conv_indices = state_indices_tensor_d
+            _conv_initial = block_idx_last_computed_token_d
+            _conv_scheduled = block_idx_last_scheduled_token_d
+
             if is_mamba_cache_all:
-                # Gather the single block ID for read/write.
-                # When IS_SPEC_DECODING is active (num_accepted_tokens != None),
-                # the SSM kernel indexes state_batch_indices[req, token_idx],
-                # so we need shape (num_decodes, seq_len), not (num_decodes,).
-                # All token positions use the same block (overwrite in place).
-                _input_block = state_indices_tensor_d.gather(
-                    1, block_idx_last_computed_token_d.unsqueeze(1)
-                )  # (num_decodes, 1)
-                _output_block = state_indices_tensor_d.gather(
-                    1, block_idx_last_scheduled_token_d.unsqueeze(1)
-                )  # (num_decodes, 1)
                 if num_accepted_tokens is not None:
-                    # MTP decode: expand to (num_decodes, num_tokens_per_seq)
-                    # so SSM kernel can index [req, token_idx]
-                    _n_tok = query_start_loc_d[1] - query_start_loc_d[0]
-                    state_indices_tensor_d_input = _input_block.expand(
-                        -1, _n_tok)
-                    state_indices_tensor_d_output = _output_block.expand(
-                        -1, _n_tok)
+                    # "all" mode + MTP: metadata has pre-built per-group
+                    # indices [content_block, spec_0, ..., spec_N].
+                    # SSM kernel uses init_token_idx to select the right
+                    # spec block for reading accepted state.
+                    state_indices_tensor_d_input = state_indices_tensor_d
+                    _output = attn_metadata.state_indices_tensor_d_output
+                    state_indices_tensor_d_output = (
+                        _output if _output is not None
+                        else state_indices_tensor_d
+                    )
+                    # Conv1d: build [content_block, output_block]
+                    _conv_indices = torch.stack([
+                        state_indices_tensor_d[:, 0],
+                        state_indices_tensor_d_output[:, 0],
+                    ], dim=1)  # (num_decodes, 2)
+                    _nd = state_indices_tensor_d.size(0)
+                    _dev = state_indices_tensor_d.device
+                    _conv_initial = torch.zeros(
+                        _nd, device=_dev, dtype=torch.int32)
+                    _conv_scheduled = torch.ones(
+                        _nd, device=_dev, dtype=torch.int32)
                 else:
-                    # Non-MTP decode: scalar per request
-                    state_indices_tensor_d_input = _input_block.squeeze(1)
-                    state_indices_tensor_d_output = _output_block.squeeze(1)
+                    # Non-MTP decode: gather single block ID
+                    state_indices_tensor_d_input = state_indices_tensor_d.gather(
+                        1, block_idx_last_computed_token_d.unsqueeze(1)
+                    ).squeeze(1)
+                    state_indices_tensor_d_output = state_indices_tensor_d.gather(
+                        1, block_idx_last_scheduled_token_d.unsqueeze(1)
+                    ).squeeze(1)
                 # for decode:
                 #   block_idx_first_scheduled_token_d ==
                 #       block_idx_last_scheduled_token_d
@@ -861,9 +873,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 self.conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=state_indices_tensor_d,
-                block_idx_last_scheduled_token=block_idx_last_scheduled_token_d,
-                initial_state_idx=block_idx_last_computed_token_d,
+                conv_state_indices=_conv_indices,
+                block_idx_last_scheduled_token=_conv_scheduled,
+                initial_state_idx=_conv_initial,
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),

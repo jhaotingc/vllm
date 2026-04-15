@@ -44,6 +44,7 @@ class BaseMambaAttentionMetadata:
     # speculative decoding compatibility, and will be None if the batch
     # has no decode requests.
     state_indices_tensor_d: torch.Tensor | None
+    state_indices_tensor_d_output: torch.Tensor | None  # for "all"+MTP: separate output block
     query_start_loc_d: torch.Tensor | None  # shape: [num_decodes + 1,]
 
     # Number of accepted tokens for each spec sequence (for loading correct checkpoint)
@@ -111,9 +112,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 self.vllm_config.model_config.max_model_len,
                 self.kv_cache_spec.block_size,
             )
-            # Speculative decoding not supported with prefix caching,
-            # so keep shape consistent with prefill buffer
-            # TODO: reduce this size as needed for decode-only cudagraph capture
+            # Add spec blocks for MTP speculative decoding
+            max_num_blocks += self.num_spec_tokens
             self.state_indices_tensor_d: torch.Tensor = torch.empty(
                 (
                     self.decode_cudagraph_max_bs,
@@ -410,11 +410,60 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             [num_decodes, num_prefills],
             dim=0,
         )
+        state_indices_tensor_d_output = None  # only set for "all" + MTP
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
             state_indices_tensor_d = state_indices_tensor_d[
                 :, : 1 + self.num_spec_tokens
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
+        elif self.use_spec_decode and num_decodes > 0:
+            # "all" mode + MTP: gather per-group spec blocks from block table.
+            # The MambaManager already allocates extra blocks per request
+            # (num_tokens += block_size * num_spec). These appear at the
+            # TAIL of each group's block table. They're per-group because
+            # each group has its own pool segment.
+            assert block_idx_last_computed_token is not None
+            assert block_idx_last_scheduled_token is not None
+            # Column 0: content block (initial state for reading)
+            content_block = state_indices_tensor_d.gather(
+                1,
+                block_idx_last_computed_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                ),
+            )  # (num_decodes, 1)
+            # Column 0 of output: block for writing token 0's state
+            output_block = state_indices_tensor_d.gather(
+                1,
+                block_idx_last_scheduled_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                ),
+            )  # (num_decodes, 1)
+            # Columns 1..N: spec blocks from block table tail.
+            # Spec blocks start at block_idx_last_scheduled + 1.
+            spec_col_offsets = torch.arange(
+                1, 1 + self.num_spec_tokens,
+                device=state_indices_tensor_d.device,
+                dtype=torch.int64,
+            )  # [1, 2, 3]
+            spec_col_indices = (
+                block_idx_last_scheduled_token[:num_decodes].unsqueeze(1).to(
+                    torch.int64
+                )
+                + spec_col_offsets.unsqueeze(0)
+            )  # (num_decodes, num_spec_tokens)
+            spec_blocks = state_indices_tensor_d.gather(
+                1, spec_col_indices
+            )  # (num_decodes, num_spec_tokens)
+            # Build input tensor: [content_block, spec_0, spec_1, spec_2]
+            state_indices_tensor_d = torch.cat(
+                [content_block.to(torch.int32), spec_blocks.to(torch.int32)],
+                dim=1,
+            )  # (num_decodes, 1 + num_spec_tokens)
+            # Build output tensor: [output_block, spec_0, spec_1, spec_2]
+            state_indices_tensor_d_output = torch.cat(
+                [output_block.to(torch.int32), spec_blocks.to(torch.int32)],
+                dim=1,
+            )  # (num_decodes, 1 + num_spec_tokens)
 
         # Sometimes even with specdec enabled we get single-token prefill chunks that
         # should be treated as decodes but don't have num_accepted_tokens set.
@@ -466,6 +515,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             has_initial_states_p=has_initial_states_p,
             state_indices_tensor_p=state_indices_tensor_p,
             state_indices_tensor_d=state_indices_tensor_d,
+            state_indices_tensor_d_output=state_indices_tensor_d_output,
             num_accepted_tokens=num_accepted_tokens,
             query_start_loc_d=query_start_loc_d,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
