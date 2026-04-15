@@ -820,12 +820,29 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Process decode requests
         if has_decode:
             if is_mamba_cache_all:
-                state_indices_tensor_d_input = state_indices_tensor_d.gather(
+                # Gather the single block ID for read/write.
+                # When IS_SPEC_DECODING is active (num_accepted_tokens != None),
+                # the SSM kernel indexes state_batch_indices[req, token_idx],
+                # so we need shape (num_decodes, seq_len), not (num_decodes,).
+                # All token positions use the same block (overwrite in place).
+                _input_block = state_indices_tensor_d.gather(
                     1, block_idx_last_computed_token_d.unsqueeze(1)
-                ).squeeze(1)
-                state_indices_tensor_d_output = state_indices_tensor_d.gather(
+                )  # (num_decodes, 1)
+                _output_block = state_indices_tensor_d.gather(
                     1, block_idx_last_scheduled_token_d.unsqueeze(1)
-                ).squeeze(1)
+                )  # (num_decodes, 1)
+                if num_accepted_tokens is not None:
+                    # MTP decode: expand to (num_decodes, num_tokens_per_seq)
+                    # so SSM kernel can index [req, token_idx]
+                    _n_tok = query_start_loc_d[1] - query_start_loc_d[0]
+                    state_indices_tensor_d_input = _input_block.expand(
+                        -1, _n_tok)
+                    state_indices_tensor_d_output = _output_block.expand(
+                        -1, _n_tok)
+                else:
+                    # Non-MTP decode: scalar per request
+                    state_indices_tensor_d_input = _input_block.squeeze(1)
+                    state_indices_tensor_d_output = _output_block.squeeze(1)
                 # for decode:
                 #   block_idx_first_scheduled_token_d ==
                 #       block_idx_last_scheduled_token_d
