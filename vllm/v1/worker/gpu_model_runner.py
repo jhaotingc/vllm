@@ -1446,7 +1446,7 @@ class GPUModelRunner(
             .argmax(-1)
         )
 
-        if self.cache_config.mamba_cache_mode in ("align", "all"):
+        if self.cache_config.mamba_cache_mode == "align":
             for i, num_tokens in enumerate(
                 self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
             ):
@@ -3921,7 +3921,7 @@ class GPUModelRunner(
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-            if self.cache_config.mamba_cache_mode in ("align", "all"):
+            if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.
