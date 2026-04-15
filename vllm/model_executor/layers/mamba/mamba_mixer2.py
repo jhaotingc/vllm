@@ -627,17 +627,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         if is_mamba_cache_all:
             # If prefix caching is enabled, retrieve the relevant variables
-            # for prefill and decode
+            # for prefill and decode. Slice to actual batch size first
+            # since cudagraph padding may have extended these tensors.
+            num_reqs = num_decodes + num_prefills
             block_idx_last_computed_token_d, block_idx_last_computed_token_p = (
                 torch.split(
-                    attn_metadata.block_idx_last_computed_token,
+                    attn_metadata.block_idx_last_computed_token[:num_reqs],
                     [num_decodes, num_prefills],
                     dim=0,
                 )
             )
             block_idx_last_scheduled_token_d, block_idx_last_scheduled_token_p = (
                 torch.split(
-                    attn_metadata.block_idx_last_scheduled_token,
+                    attn_metadata.block_idx_last_scheduled_token[:num_reqs],
                     [num_decodes, num_prefills],
                     dim=0,
                 )

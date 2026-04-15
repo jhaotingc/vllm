@@ -550,11 +550,29 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             padded_bs = metadata.num_reqs
-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
-                state_indices_tensor_d, non_blocking=True
-            )
-            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
+            ncols = state_indices_tensor_d.size(1)
+            self.state_indices_tensor_d[
+                : metadata.num_decodes, :ncols
+            ].copy_(state_indices_tensor_d, non_blocking=True)
+            state_indices_tensor_d = self.state_indices_tensor_d[
+                :padded_bs, :ncols
+            ]
             state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+
+            # Handle output tensor for all+MTP spec blocks
+            state_indices_tensor_d_output = metadata.state_indices_tensor_d_output
+            if state_indices_tensor_d_output is not None:
+                if not hasattr(self, "_cg_state_indices_d_output"):
+                    self._cg_state_indices_d_output = torch.empty_like(
+                        self.state_indices_tensor_d
+                    )
+                self._cg_state_indices_d_output[
+                    : metadata.num_decodes, :ncols
+                ].copy_(state_indices_tensor_d_output, non_blocking=True)
+                state_indices_tensor_d_output = self._cg_state_indices_d_output[
+                    :padded_bs, :ncols
+                ]
+                state_indices_tensor_d_output[metadata.num_decodes :] = NULL_BLOCK_ID
 
             if self.use_spec_decode and num_accepted_tokens is not None:
                 assert query_start_loc_d is not None
@@ -589,6 +607,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
+            state_indices_tensor_d_output=metadata.state_indices_tensor_d_output
+                if not (metadata.num_prefills == 0
+                        and metadata.num_decodes <= self.decode_cudagraph_max_bs
+                        and self.compilation_config.cudagraph_mode.has_full_cudagraphs())
+                else (state_indices_tensor_d_output
+                      if hasattr(self, "_cg_state_indices_d_output")
+                         and metadata.state_indices_tensor_d_output is not None
+                      else metadata.state_indices_tensor_d_output),
             query_start_loc_d=query_start_loc_d,
             num_accepted_tokens=num_accepted_tokens,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
