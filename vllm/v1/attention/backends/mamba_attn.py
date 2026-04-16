@@ -114,6 +114,25 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
             # Add spec blocks for MTP speculative decoding
             max_num_blocks += self.num_spec_tokens
+            # Pre-allocate buffers for spec block construction (Fixes #2-4)
+            self._cg_state_indices_d_output: torch.Tensor | None = None
+            if self.use_spec_decode:
+                self._spec_col_offsets = torch.arange(
+                    1, 1 + self.num_spec_tokens,
+                    device=device, dtype=torch.int64,
+                )
+                self._spec_input_buf = torch.empty(
+                    (self.decode_cudagraph_max_bs, 1 + self.num_spec_tokens),
+                    dtype=torch.int32, device=device,
+                )
+                self._spec_output_buf = torch.empty(
+                    (self.decode_cudagraph_max_bs, 1 + self.num_spec_tokens),
+                    dtype=torch.int32, device=device,
+                )
+                self._block_idx_i64 = torch.empty(
+                    (self.decode_cudagraph_max_bs, 1),
+                    dtype=torch.int64, device=device,
+                )
             self.state_indices_tensor_d: torch.Tensor = torch.empty(
                 (
                     self.decode_cudagraph_max_bs,
@@ -424,46 +443,29 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             # each group has its own pool segment.
             assert block_idx_last_computed_token is not None
             assert block_idx_last_scheduled_token is not None
-            # Column 0: content block (initial state for reading)
-            content_block = state_indices_tensor_d.gather(
-                1,
-                block_idx_last_computed_token[:num_decodes].unsqueeze(1).to(
-                    torch.int64
-                ),
-            )  # (num_decodes, 1)
-            # Column 0 of output: block for writing token 0's state
-            output_block = state_indices_tensor_d.gather(
-                1,
-                block_idx_last_scheduled_token[:num_decodes].unsqueeze(1).to(
-                    torch.int64
-                ),
-            )  # (num_decodes, 1)
-            # Columns 1..N: spec blocks from block table tail.
-            # Spec blocks start at block_idx_last_scheduled + 1.
-            spec_col_offsets = torch.arange(
-                1, 1 + self.num_spec_tokens,
-                device=state_indices_tensor_d.device,
-                dtype=torch.int64,
-            )  # [1, 2, 3]
+            # Gather content/output/spec blocks using pre-allocated buffers
+            idx_buf = self._block_idx_i64[:num_decodes]
+            idx_buf[:, 0] = block_idx_last_computed_token[:num_decodes]
+            content_block = state_indices_tensor_d.gather(1, idx_buf)
+
+            idx_buf[:, 0] = block_idx_last_scheduled_token[:num_decodes]
+            output_block = state_indices_tensor_d.gather(1, idx_buf)
+
             spec_col_indices = (
-                block_idx_last_scheduled_token[:num_decodes].unsqueeze(1).to(
-                    torch.int64
-                )
-                + spec_col_offsets.unsqueeze(0)
+                idx_buf + self._spec_col_offsets.unsqueeze(0)
             )  # (num_decodes, num_spec_tokens)
-            spec_blocks = state_indices_tensor_d.gather(
-                1, spec_col_indices
-            )  # (num_decodes, num_spec_tokens)
-            # Build input tensor: [content_block, spec_0, spec_1, spec_2]
-            state_indices_tensor_d = torch.cat(
-                [content_block.to(torch.int32), spec_blocks.to(torch.int32)],
-                dim=1,
-            )  # (num_decodes, 1 + num_spec_tokens)
-            # Build output tensor: [output_block, spec_0, spec_1, spec_2]
-            state_indices_tensor_d_output = torch.cat(
-                [output_block.to(torch.int32), spec_blocks.to(torch.int32)],
-                dim=1,
-            )  # (num_decodes, 1 + num_spec_tokens)
+            spec_blocks = state_indices_tensor_d.gather(1, spec_col_indices)
+
+            # Write into pre-allocated buffers (no torch.cat)
+            out = self._spec_input_buf[:num_decodes]
+            out[:, 0] = content_block[:, 0]
+            out[:, 1:] = spec_blocks
+            state_indices_tensor_d = out
+
+            out2 = self._spec_output_buf[:num_decodes]
+            out2[:, 0] = output_block[:, 0]
+            out2[:, 1:] = spec_blocks
+            state_indices_tensor_d_output = out2
 
         # Sometimes even with specdec enabled we get single-token prefill chunks that
         # should be treated as decodes but don't have num_accepted_tokens set.
@@ -562,7 +564,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             # Handle output tensor for all+MTP spec blocks
             state_indices_tensor_d_output = metadata.state_indices_tensor_d_output
             if state_indices_tensor_d_output is not None:
-                if not hasattr(self, "_cg_state_indices_d_output"):
+                if self._cg_state_indices_d_output is None:
                     self._cg_state_indices_d_output = torch.empty_like(
                         self.state_indices_tensor_d
                     )
@@ -607,14 +609,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
-            state_indices_tensor_d_output=metadata.state_indices_tensor_d_output
-                if not (metadata.num_prefills == 0
-                        and metadata.num_decodes <= self.decode_cudagraph_max_bs
-                        and self.compilation_config.cudagraph_mode.has_full_cudagraphs())
-                else (state_indices_tensor_d_output
-                      if hasattr(self, "_cg_state_indices_d_output")
-                         and metadata.state_indices_tensor_d_output is not None
-                      else metadata.state_indices_tensor_d_output),
+            state_indices_tensor_d_output=(
+                state_indices_tensor_d_output
+                if (metadata.num_prefills == 0
+                    and metadata.num_decodes <= self.decode_cudagraph_max_bs
+                    and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                    and metadata.state_indices_tensor_d_output is not None)
+                else metadata.state_indices_tensor_d_output
+            ),
             query_start_loc_d=query_start_loc_d,
             num_accepted_tokens=num_accepted_tokens,
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,

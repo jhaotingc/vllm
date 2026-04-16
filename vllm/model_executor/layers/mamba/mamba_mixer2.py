@@ -485,6 +485,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
         compilation_config.static_forward_context[prefix] = self
         # The tuple is (conv_state, ssm_state)
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
+        # Pre-allocated buffers for MTP+all mode conv indices (Fix #1)
+        self._conv_indices_buf: torch.Tensor | None = None
+        self._conv_initial_buf: torch.Tensor | None = None
+        self._conv_scheduled_buf: torch.Tensor | None = None
 
         self.model_config = model_config
         self.cache_config = cache_config
@@ -839,16 +843,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         else state_indices_tensor_d
                     )
                     # Conv1d: build [content_block, output_block]
-                    _conv_indices = torch.stack([
-                        state_indices_tensor_d[:, 0],
-                        state_indices_tensor_d_output[:, 0],
-                    ], dim=1)  # (num_decodes, 2)
+                    # Use pre-allocated buffers to avoid per-step allocs
                     _nd = state_indices_tensor_d.size(0)
-                    _dev = state_indices_tensor_d.device
-                    _conv_initial = torch.zeros(
-                        _nd, device=_dev, dtype=torch.int32)
-                    _conv_scheduled = torch.ones(
-                        _nd, device=_dev, dtype=torch.int32)
+                    if (self._conv_indices_buf is None
+                            or self._conv_indices_buf.size(0) < _nd):
+                        _dev = state_indices_tensor_d.device
+                        _cap = max(_nd, 32)
+                        self._conv_indices_buf = torch.empty(
+                            (_cap, 2), dtype=torch.int32, device=_dev)
+                        self._conv_initial_buf = torch.zeros(
+                            _cap, dtype=torch.int32, device=_dev)
+                        self._conv_scheduled_buf = torch.ones(
+                            _cap, dtype=torch.int32, device=_dev)
+                    self._conv_indices_buf[:_nd, 0] = state_indices_tensor_d[:, 0]
+                    self._conv_indices_buf[:_nd, 1] = state_indices_tensor_d_output[:, 0]
+                    _conv_indices = self._conv_indices_buf[:_nd]
+                    _conv_initial = self._conv_initial_buf[:_nd]
+                    _conv_scheduled = self._conv_scheduled_buf[:_nd]
                 else:
                     # Non-MTP decode: gather single block ID
                     state_indices_tensor_d_input = state_indices_tensor_d.gather(
