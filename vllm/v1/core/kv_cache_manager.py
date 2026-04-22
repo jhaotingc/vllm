@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -255,7 +256,16 @@ class KVCacheManager:
             num_tokens_main_model=full_num_tokens,
         )
 
-        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+        num_free = self.block_pool.get_num_free_blocks()
+        if num_blocks_to_allocate > num_free and envs.VLLM_PIN_PREFIX_BLOCKS:
+            # Under pressure: demote oldest pinned blocks to make room.
+            # can_fit_full_sequence is called before allocate_slots and
+            # gates admission independently; without this hook the
+            # scheduler would stall even if demotable pins exist.
+            deficit = num_blocks_to_allocate - num_free
+            self.block_pool.demote_n(deficit)
+            num_free = self.block_pool.get_num_free_blocks()
+        return num_blocks_to_allocate <= num_free
 
     def allocate_slots(
         self,
@@ -393,8 +403,12 @@ class KVCacheManager:
 
         num_free_blocks = self.block_pool.get_num_free_blocks()
         if num_blocks_to_allocate > num_free_blocks:
-            # Cannot allocate new blocks
-            return None
+            # Under pressure: demote oldest pinned blocks to make room.
+            deficit = num_blocks_to_allocate - num_free_blocks
+            self.block_pool.demote_n(deficit)
+            num_free_blocks = self.block_pool.get_num_free_blocks()
+            if num_blocks_to_allocate > num_free_blocks:
+                return None
 
         # The SWA-capped admission estimate can be lower than the actual
         # allocator demand when a request already owns some blocks. Re-check
@@ -403,7 +417,14 @@ class KVCacheManager:
         actual_num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             **block_allocation_kwargs)
         if actual_num_blocks_to_allocate > num_free_blocks:
-            return None
+            # Under pressure: try unpinning the oldest pinned blocks to make
+            # room. Hashes survive until physically recycled, so unpinned
+            # blocks remain prefix-cache candidates.
+            deficit = actual_num_blocks_to_allocate - num_free_blocks
+            self.block_pool.demote_n(deficit)
+            num_free_blocks = self.block_pool.get_num_free_blocks()
+            if actual_num_blocks_to_allocate > num_free_blocks:
+                return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -451,6 +472,16 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        # is_pinned design: when prefix-cache pinning is enabled, mark
+        # all of this request's remaining (non-null) blocks as pinned so
+        # they land in the pinned_free_deque instead of the regular free
+        # queue. Full-attention blocks protect the full prefix; SWA
+        # window blocks protect the last-window hashes.
+        if envs.VLLM_PIN_PREFIX_BLOCKS:
+            for mgr in self.coordinator.single_type_managers:
+                for b in mgr.req_to_blocks.get(request.request_id, ()):
+                    if not b.is_null:
+                        b.is_pinned = True
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
