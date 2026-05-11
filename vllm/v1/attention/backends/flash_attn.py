@@ -774,6 +774,37 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_q = attn_metadata.max_query_len
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
+            # --- GHOST BLOCK ATTN DEBUG ---
+            import sys as _sys
+            if not hasattr(self, "_attn_step"):
+                self._attn_step = 0
+            self._attn_step += 1
+            if self._attn_step <= 10:
+                _nr = int(cu_seqlens_q.shape[0]) - 1
+                _block_size = 16
+                _sys.stderr.write(
+                    f"[ATTN_DBG step={self._attn_step}] num_reqs={_nr} "
+                    f"block_table.shape={tuple(block_table.shape) if block_table is not None else None} "
+                    f"seqused_k={seqused_k.tolist()}\n"
+                )
+                for _i in range(_nr):
+                    _qstart = int(cu_seqlens_q[_i].item())
+                    _qend = int(cu_seqlens_q[_i + 1].item())
+                    _qlen = _qend - _qstart
+                    _klen = int(seqused_k[_i].item())
+                    _nblocks = (_klen + _block_size - 1) // _block_size
+                    _row = block_table[_i, :_nblocks].tolist() if block_table is not None else []
+                    _ghost = [b for b in _row if 1792 <= b <= 1962]
+                    _qnorm = query[_qstart:_qend].float().norm().item() if _qlen > 0 else 0.0
+                    _sys.stderr.write(
+                        f"[ATTN_DBG step={self._attn_step}] req[{_i}] "
+                        f"qlen={_qlen} klen={_klen} nblocks={_nblocks} "
+                        f"last8_blocks={_row[-8:]} "
+                        f"GHOST_BLOCKS={_ghost} "
+                        f"qnorm={_qnorm:.4f}\n"
+                    )
+                _sys.stderr.flush()
+            # --- END GHOST BLOCK ATTN DEBUG ---
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
