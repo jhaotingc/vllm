@@ -4151,6 +4151,22 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                import sys as _sys
+                if not hasattr(self, "_dbg_step"):
+                    self._dbg_step = 0
+                self._dbg_step += 1
+                if self._dbg_step <= 15:
+                    _nr = self.input_batch.num_reqs
+                    for _i in range(_nr):
+                        _hs = sample_hidden_states[_i].float()
+                        _norm = _hs.norm().item()
+                        _f4 = _hs[:4].tolist()
+                        _rid = self.input_batch.req_ids[_i][:16]
+                        _sys.stderr.write(
+                            f"[HIDDEN step={self._dbg_step}] req[{_i}]={_rid} "
+                            f"norm={_norm:.4f} vals={[round(v,4) for v in _f4]}\n"
+                        )
+                    _sys.stderr.flush()
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.

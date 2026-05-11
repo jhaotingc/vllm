@@ -220,6 +220,13 @@ class KVCacheManager:
                 preempted=request.num_preemptions > 0,
             )
 
+        import sys as _sys
+        _sys.stderr.write(
+            f"[GET_COMPUTED] req={request.request_id[:8]} "
+            f"num_computed={num_new_computed_tokens} "
+            f"blocks_raw={len(computed_blocks[0])}\n"
+        )
+        _sys.stderr.flush()
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def allocate_slots(
@@ -411,7 +418,32 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
+        import sys as _sys
+        _total_before = sum(
+            len(m.req_to_blocks.get(request.request_id, []))
+            for m in self.coordinator.single_type_managers
+        )
+        _cached_before = sum(
+            m.num_cached_block.get(request.request_id, 0)
+            for m in self.coordinator.single_type_managers
+        )
+        _sys.stderr.write(
+            f"[CACHE_BLOCKS_PRE] req={request.request_id[:8]} "
+            f"num_tokens_to_cache={num_tokens_to_cache} "
+            f"cached_blocks_before={_cached_before}\n"
+        )
+        _sys.stderr.flush()
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        _cached_after = sum(
+            m.num_cached_block.get(request.request_id, 0)
+            for m in self.coordinator.single_type_managers
+        )
+        _sys.stderr.write(
+            f"[CACHE_BLOCKS_POST] req={request.request_id[:8]} "
+            f"newly_cached_blocks={_cached_after - _cached_before} "
+            f"total_cached={_cached_after}\n"
+        )
+        _sys.stderr.flush()
 
         return self.create_kv_cache_blocks(new_blocks)
 

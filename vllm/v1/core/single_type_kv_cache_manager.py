@@ -298,6 +298,18 @@ class SingleTypeKVCacheManager(ABC):
             kv_cache_group_id=self.kv_cache_group_id,
         )
 
+        import sys as _sys
+        new_block_ids = [
+            b.block_id
+            for b in self.req_to_blocks[request.request_id][num_cached_blocks:num_full_blocks]
+        ]
+        _sys.stderr.write(
+            f"[MANAGER cache_blocks] req={request.request_id[:8]} "
+            f"blocks {num_cached_blocks}→{num_full_blocks} "
+            f"({num_full_blocks - num_cached_blocks} new) "
+            f"ids={new_block_ids[:8]}" + ("..." if len(new_block_ids)>8 else "") + "\n",
+        )
+        _sys.stderr.flush()
         self.num_cached_block[request.request_id] = num_full_blocks
 
     def free(self, request_id: str) -> None:
@@ -481,10 +493,19 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     computed.append(cached)
             else:
                 break
+        import sys as _sys
+        _n_raw = len(computed_blocks[0])
+        _ids_raw = [b.block_id for b in computed_blocks[0][:4]]
         if use_eagle and computed_blocks[0]:
             # Need to drop the last matched block if eagle is enabled.
             for computed in computed_blocks:
                 computed.pop()
+        _n_after = len(computed_blocks[0])
+        _sys.stderr.write(
+            f"[FIND_CACHE_HIT] blocks_raw={_n_raw} after_eagle={_n_after} "
+            f"use_eagle={use_eagle} first_ids={_ids_raw}\n"
+        )
+        _sys.stderr.flush()
         while (
             block_size != alignment_tokens  # Faster for common case.
             and len(computed_blocks[0]) * block_size % alignment_tokens != 0

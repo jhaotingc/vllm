@@ -340,6 +340,16 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        import sys as _sys
+        if not hasattr(self, "_dbg_step"):
+            self._dbg_step = 0
+        self._dbg_step += 1
+        _sys.stderr.write(
+            f"\n[STEP {self._dbg_step}] budget={token_budget} "
+            f"running={len(self.running)} "
+            f"waiting_approx={getattr(self.waiting, "size", "?")!s}\n"
+        )
+        _sys.stderr.flush()
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
@@ -430,6 +440,12 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[STEP {self._dbg_step}][RUN] req={request.request_id[:8]} "
+                            f"computed={request.num_computed_tokens} new={num_new_tokens}\n"
+                        )
+                        _sys.stderr.flush()
                         break
 
                     # The request cannot be scheduled.
@@ -574,6 +590,13 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[STEP {self._dbg_step}][WAIT/get] req={request.request_id[:8]} "
+                        f"local_computed={num_new_local_computed_tokens} "
+                        f"computed_blocks={len(new_computed_blocks.blocks[0])}\n"
+                    )
+                    _sys.stderr.flush()
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
