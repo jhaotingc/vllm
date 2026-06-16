@@ -3739,13 +3739,36 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
+        # --- NCU step-gated CUDA profiler window (env VLLM_NCU_PROFILE_STEP) ---
+        # cudaProfilerStart/Stop run here in EAGER host code, OUTSIDE any CUDA
+        # graph, so they fire at graph-replay time and bracket exactly this
+        # step's model forward. Pair with `ncu --profile-from-start off`.
+        # Counts only real execute_model forwards (dummy / cudagraph-capture
+        # runs call self.model() directly elsewhere). No-op when env is -1.
+        if not hasattr(self, "_ncu_profile_step"):
+            import os
+
+            self._ncu_profile_step = int(
+                os.environ.get("VLLM_NCU_PROFILE_STEP", "-1")
+            )
+            self._ncu_fwd_counter = 0
+        _ncu_active = False
+        if self._ncu_profile_step >= 0:
+            if self._ncu_fwd_counter == self._ncu_profile_step:
+                torch.cuda.cudart().cudaProfilerStart()
+                _ncu_active = True
+            self._ncu_fwd_counter += 1
+        try:
+            return self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+        finally:
+            if _ncu_active:
+                torch.cuda.cudart().cudaProfilerStop()
 
     @staticmethod
     def _is_uniform_decode(
