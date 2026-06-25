@@ -423,8 +423,9 @@ def triton_kernel_fused_experts(
     a1q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of fused expert computation using OAI kernels."""
-    assert activation == MoEActivation.SWIGLUOAI, (
-        "Only SWIGLUOAI activation is supported"
+    assert activation in (MoEActivation.SWIGLUOAI, MoEActivation.SILU), (
+        f"Unsupported activation {activation}; "
+        "only SWIGLUOAI and SILU are supported"
     )
     assert quant_config is not None
 
@@ -458,20 +459,28 @@ def triton_kernel_fused_experts(
     )
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
+    if activation == MoEActivation.SILU:
+        # Plain gated SiLU: silu(gate) * up. Optional clamp via
+        # quant_config.gemm1_clamp_limit (None => no clamp, e.g. Qwen3).
+        act_name = "silu_mul"
+        act_fn = triton_kernels.swiglu.silu_mul_fn
+        act_arg_names = ("limit",)
+        act_args = (quant_config.gemm1_clamp_limit,)
+    else:  # MoEActivation.SWIGLUOAI
+        act_name = "swiglu"
+        act_fn = triton_kernels.swiglu.swiglu_fn
+        act_arg_names = ("alpha", "limit")
+        act_args = (swiglu_alpha, swiglu_limit)
+
     act = (
         FusedActivation(
-            FnSpecs(
-                "swiglu",
-                triton_kernels.swiglu.swiglu_fn,
-                ("alpha", "limit"),
-                reduction_n=2,
-            ),
-            (swiglu_alpha, swiglu_limit),
+            FnSpecs(act_name, act_fn, act_arg_names, reduction_n=2),
+            act_args,
         )
         if not use_legacy_triton_kernels
         else FusedActivation(
-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
-            (swiglu_alpha, swiglu_limit),
+            FnSpecs(act_name, act_fn, act_arg_names),
+            act_args,
             2,
         )
     )
@@ -662,7 +671,7 @@ class OAITritonExperts(BaseOAITritonExperts):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SWIGLUOAI
+        return activation in (MoEActivation.SWIGLUOAI, MoEActivation.SILU)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -1018,7 +1027,7 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SWIGLUOAI
+        return activation in (MoEActivation.SWIGLUOAI, MoEActivation.SILU)
 
     @staticmethod
     def _supports_parallel_config(
@@ -1076,6 +1085,7 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
             gating_output=router_logits,
             topk=self.topk,
             renormalize=self.renormalize,
+            activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             quant_config=self.quant_config,
