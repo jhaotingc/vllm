@@ -552,6 +552,17 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
+            # HF-style mxfp4 ("-direct") checkpoints store packed MoE experts as
+            # *.weight_blocks (3D [out, n_kblocks, 16]) and *.weight_scales (2D).
+            # Remap to vLLM's *.weight / *.weight_scale params and flatten the 3D
+            # block tensor to 2D [out, n_kblocks*16] so the standard expert loader
+            # (gate/up -> w13, down -> w2) can place them.
+            if name.endswith(".weight_blocks"):
+                if loaded_weight.dim() == 3:
+                    loaded_weight = loaded_weight.reshape(loaded_weight.shape[0], -1)
+                name = name[: -len(".weight_blocks")] + ".weight"
+            elif name.endswith(".weight_scales"):
+                name = name[: -len(".weight_scales")] + ".weight_scale"
             if "scale" in name or "zero_point" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:

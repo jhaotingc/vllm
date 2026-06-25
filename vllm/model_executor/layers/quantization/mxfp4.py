@@ -3,6 +3,7 @@
 
 import torch
 
+import os
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -35,6 +36,18 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
+
+
+def _interleave_gate_up_w13(t: torch.Tensor) -> torch.Tensor:
+    """Reorder a fused w13 tensor from contiguous halves [gate; up] to
+    interleaved [g0, u0, g1, u1, ...] along dim 1, as required by the OAI
+    Triton fused MoE kernel (matmul_ogs, reduction_n=2). Applies to the mxfp4
+    weight blocks, per-block weight scales, and bias (all share dim1=2*I)."""
+    n = t.shape[1]
+    half = n // 2
+    g = t[:, :half]
+    u = t[:, half:]
+    return torch.stack((g, u), dim=2).reshape(t.shape[0], n, *t.shape[2:]).contiguous()
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -388,6 +401,21 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
+        # OAI Triton fused kernel needs w13 gate/up *interleaved*. gpt-oss ships
+        # interleaved; Qwen3 etc. merge to contiguous halves, so interleave at
+        # load when explicitly requested (default off keeps gpt-oss intact).
+        if (
+            self.mxfp4_backend == Mxfp4MoeBackend.TRITON
+            and os.environ.get("VLLM_MXFP4_INTERLEAVE_W13", "0") == "1"
+        ):
+            w13 = _interleave_gate_up_w13(w13)
+            w13_scale = _interleave_gate_up_w13(w13_scale)
+            if w13_bias is not None:
+                w13_bias = _interleave_gate_up_w13(w13_bias)
+            logger.info_once(
+                "MXFP4 TRITON: interleaved w13 gate/up at load for OAI fused kernel"
+            )
+
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 
     def get_fused_moe_quant_config(
@@ -731,6 +759,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
+
+        # OAI Triton fused kernel needs w13 gate/up *interleaved*. gpt-oss ships
+        # interleaved; Qwen3 etc. merge to contiguous halves, so interleave at
+        # load when explicitly requested (default off keeps other paths intact).
+        if (
+            self.mxfp4_backend == Mxfp4MoeBackend.TRITON
+            and os.environ.get("VLLM_MXFP4_INTERLEAVE_W13", "0") == "1"
+        ):
+            w13 = _interleave_gate_up_w13(w13)
+            w13_scale = _interleave_gate_up_w13(w13_scale)
+            if w13_bias is not None:
+                w13_bias = _interleave_gate_up_w13(w13_bias)
+            logger.info_once(
+                "MXFP4 TRITON: interleaved w13 gate/up at load for OAI fused kernel"
+            )
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 
