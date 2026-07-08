@@ -118,12 +118,33 @@ class DFlashProposer(SpecDecodeBaseProposer):
         arch = base.model_config.model_arch_config
         if arch.is_mm_prefix_lm:
             base.model_config.model_arch_config = replace(arch, is_mm_prefix_lm=False)
+        # QK-norm+RoPE fusion is unsafe for the DFlash draft: the fusion pass
+        # specializes the q/k/v split to the *target* model's head layout, which
+        # differs from the draft's, producing a "split sizes ... vs tensor size"
+        # mismatch under torch.compile. Force it off for the draft only; the
+        # target keeps whatever enable_qk_norm_rope_fusion the user configured.
+        draft_compilation_config = replace(
+            base.compilation_config,
+            pass_config=replace(
+                base.compilation_config.pass_config,
+                enable_qk_norm_rope_fusion=False,
+            ),
+        )
+        # `replace` re-initializes init=False fields (static_forward_context is
+        # one), giving the draft a fresh empty dict. Re-share it with the base so
+        # draft attention layers register into — and are looked up from — the same
+        # forward-context dict at runtime; otherwise no_compile_layers raises a
+        # KeyError on draft layers (e.g. "model.layers.40.self_attn.attn").
+        draft_compilation_config.static_forward_context = (
+            base.compilation_config.static_forward_context
+        )
         return replace(
             base,
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=not self.dflash_causal,
             ),
+            compilation_config=draft_compilation_config,
         )
 
     @override
