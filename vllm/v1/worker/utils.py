@@ -5,14 +5,15 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product as iprod
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
 from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
@@ -24,12 +25,13 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadataBuilder,
-    MultipleOf,
+    KernelPageRequirements,
 )
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    KVCacheAllocationPlan,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
@@ -327,18 +329,18 @@ class AttentionGroup:
 
 def select_common_block_size(
     kv_manager_block_size: int,
-    backends: list[type[AttentionBackend]],
+    requirements: Sequence[KernelPageRequirements],
 ) -> int:
     """
-    Select a block size that is supported by all backends and is a factor of
+    Select a block size that is supported by all requirements and is a factor of
     kv_manager_block_size.
 
-    If kv_manager_block_size is supported by all backends, return it directly.
+    If kv_manager_block_size is supported by all requirements, return it directly.
     Otherwise, return the max supported size.
 
     Args:
         kv_manager_block_size: Block size of KV cache.
-        backends: List of attention backend classes.
+        requirements: Page requirements of the selected kernels.
 
     Returns:
         The selected block size.
@@ -347,49 +349,33 @@ def select_common_block_size(
         ValueError: If no valid block size found.
     """
 
-    def block_size_is_supported(
-        backends: list[type[AttentionBackend]], block_size: int
-    ) -> bool:
-        """Check if the block size is supported by all backends."""
-        for backend in backends:
-            is_supported = False
-            for supported_size in backend.get_supported_kernel_block_sizes():
-                if isinstance(supported_size, int):
-                    if block_size == supported_size:
-                        is_supported = True
-                elif isinstance(supported_size, MultipleOf):
-                    if block_size % supported_size.base == 0:
-                        is_supported = True
-                else:
-                    raise ValueError(f"Unknown supported size: {supported_size}")
-            if not is_supported:
-                return False
-        return True
+    def block_size_is_supported(block_size: int) -> bool:
+        return all(requirement.supports(block_size) for requirement in requirements)
 
-    # Case 1: if the block_size of kv cache manager is supported by all backends,
+    # Case 1: if the block_size of kv cache manager is supported by all requirements,
     # return it directly.
-    if block_size_is_supported(backends, kv_manager_block_size):
+    if block_size_is_supported(kv_manager_block_size):
         return kv_manager_block_size
 
     # Case 2: otherwise, the block_size must be an `int`-format supported size of
     # at least one backend. Iterate over all `int`-format supported sizes in
-    # descending order and return the first one that is supported by all backends.
+    # descending order and return the first one that is supported by all requirements.
     # Simple proof:
     # If the supported size b is in MultipleOf(x_i) format for all attention
-    # backends i, and b a factor of kv_manager_block_size, then
+    # requirements i, and b a factor of kv_manager_block_size, then
     # kv_manager_block_size also satisfies MultipleOf(x_i) for all i. We will
     # return kv_manager_block_size in case 1.
     all_int_supported_sizes = set(
         supported_size
-        for backend in backends
-        for supported_size in backend.get_supported_kernel_block_sizes()
+        for requirement in requirements
+        for supported_size in requirement.supported_sizes
         if isinstance(supported_size, int)
     )
 
     for supported_size in sorted(all_int_supported_sizes, reverse=True):
         if kv_manager_block_size % supported_size != 0:
             continue
-        if block_size_is_supported(backends, supported_size):
+        if block_size_is_supported(supported_size):
             return supported_size
     raise ValueError(f"No common block size for {kv_manager_block_size}. ")
 
@@ -460,23 +446,36 @@ def allocate_kv_cache(
 
 
 def prepare_kernel_block_sizes(
-    kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+    kv_cache_config: KVCacheConfig,
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
 ) -> list[int]:
     """
     Generate kernel_block_sizes that matches each block_size.
 
     For attention backends that support virtual block splitting,
-    use the supported block sizes from the backend.
+    use the page requirements captured when their kernels were selected.
     For other backends (like Mamba), use the same block size (no splitting).
 
     Args:
         kv_cache_config: The KV cache configuration.
         attn_groups: Attention groups indexed by KV cache group id.
+        vllm_config: Configuration containing the loaded attention layers.
 
     Returns:
         List of kernel block sizes for each cache group.
     """
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+
+    uniform_transfer_split = (
+        has_kv_transfer_group()
+        and get_kv_transfer_group().requires_uniform_transfer_split
+    )
     kernel_block_sizes = []
+    transfer_requirements = []
     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group.kv_cache_spec
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -488,11 +487,29 @@ def prepare_kernel_block_sizes(
         if isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
-            group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
+            layer_names = [
+                name
+                for group in attn_groups[kv_cache_gid]
+                for name in group.layer_names
+            ]
+            layers = get_layers_from_vllm_config(
+                vllm_config, cast(type[Any], AttentionLayerBase), layer_names
+            )
             selected_kernel_size = select_common_block_size(
-                kv_manager_block_size, group_backends
+                kv_manager_block_size,
+                [layer.kernel_page_requirements for layer in layers.values()],
             )
             kernel_block_sizes.append(selected_kernel_size)
+            if uniform_transfer_split and kv_cache_group.enable_kv_transfer:
+                transfer_requirements.append(
+                    (
+                        kv_cache_gid,
+                        kv_cache_spec,
+                        tuple(
+                            layer.kernel_page_requirements for layer in layers.values()
+                        ),
+                    )
+                )
         elif isinstance(kv_cache_spec, MambaSpec):
             # This is likely Mamba or other non-attention cache, no splitting.
             kernel_block_sizes.append(kv_cache_spec.block_size)
@@ -500,6 +517,40 @@ def prepare_kernel_block_sizes(
             raise NotImplementedError(
                 f"unknown kv cache spec {kv_cache_group.kv_cache_spec}"
             )
+    transfer_ratio = 1
+    if transfer_requirements:
+        logical_size = vllm_config.cache_config.block_size
+        # Transfer protocols use one split ratio for all registered groups.
+        # Resolve it here so tensor allocation and registration agree.
+        for ratio in range(1, logical_size + 1):
+            if logical_size % ratio:
+                continue
+            if all(
+                spec.block_size % ratio == 0
+                and (not spec.page_size_padded or ratio == 1)
+                and (
+                    spec.storage_block_size == spec.block_size // ratio
+                    if isinstance(spec, MLAAttentionSpec)
+                    and spec.storage_block_size is not None
+                    else all(req.supports(spec.block_size // ratio) for req in reqs)
+                )
+                for _, spec, reqs in transfer_requirements
+            ):
+                transfer_ratio = ratio
+                break
+        else:
+            raise ValueError(
+                "No common KV transfer split ratio for the selected kernels"
+            )
+        for group_id, spec, _ in transfer_requirements:
+            if not (
+                isinstance(spec, MLAAttentionSpec)
+                and spec.storage_block_size is not None
+            ):
+                kernel_block_sizes[group_id] = spec.block_size // transfer_ratio
+    kv_cache_config.allocation_plan = KVCacheAllocationPlan(
+        tuple(kernel_block_sizes), transfer_ratio
+    )
     return kernel_block_sizes
 
 

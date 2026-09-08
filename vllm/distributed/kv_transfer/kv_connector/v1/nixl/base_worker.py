@@ -75,6 +75,7 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     KpoolTailSpec,
+    KVCacheAllocationPlan,
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
@@ -84,7 +85,6 @@ from vllm.v1.kv_cache_interface import (
     iter_layer_specs,
 )
 from vllm.v1.worker.block_table import BlockTable
-from vllm.v1.worker.utils import select_common_block_size
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -659,8 +659,8 @@ class NixlBaseConnectorWorker:
         self.expected_consumer_notifications_by_req: dict[ReqId, int] = {}
         self.xfer_stats = NixlKVConnectorStats()
 
+        self._logical_num_blocks = self.num_blocks
         self._physical_blocks_per_logical_kv_block = 1
-        self._sync_block_size_with_kernel()
 
         # Unwrap UniformTypeKVCacheSpecs to get the representative spec type
         self._group_spec_types = tuple(
@@ -711,24 +711,17 @@ class NixlBaseConnectorWorker:
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
             )
 
-    def _sync_block_size_with_kernel(self) -> None:
-        backends = get_current_attn_backends(self.vllm_config)
-        kernel_block_size = select_common_block_size(self.block_size, backends)
-        # Number of blocks not accounting for kernel block mismatches
-        self._logical_num_blocks = self.num_blocks
-        if self.block_size != kernel_block_size:
-            logger.info_once(
-                "User-specified logical block size (%s) does not match"
-                " physical kernel block size (%s). Using the latter.",
-                self.block_size,
-                kernel_block_size,
-            )
-            assert self.block_size > kernel_block_size
-            self._physical_blocks_per_logical_kv_block = (
-                self.block_size // kernel_block_size
-            )
-            self.block_size = kernel_block_size
-            self.num_blocks *= self._physical_blocks_per_logical_kv_block
+    def apply_allocation_plan(self, allocation_plan: KVCacheAllocationPlan) -> None:
+        self._physical_blocks_per_logical_kv_block = (
+            allocation_plan.transfer_block_ratio
+        )
+        self.block_size = (
+            self.vllm_config.cache_config.block_size
+            // allocation_plan.transfer_block_ratio
+        )
+        self.num_blocks = (
+            self._logical_num_blocks * allocation_plan.transfer_block_ratio
+        )
 
     def _validate_csa_linear_tp_layout(self, remote_tp_size: int) -> None:
         """Reject P/D pairs whose main-KV pages have different head layouts.

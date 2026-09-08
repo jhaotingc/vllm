@@ -50,6 +50,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheAllocationPlan
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -260,6 +261,18 @@ class KVConnectorBase_V1(ABC):
             bool: True if connector metadata exists, False otherwise.
         """
         return self._connector_metadata is not None
+
+    @property
+    def requires_uniform_transfer_split(self) -> bool:
+        return False
+
+    def register_kv_cache_layout(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        allocation_plan: "KVCacheAllocationPlan",
+    ) -> None:
+        """Register allocated tensors together with their resolved page layout."""
+        self.register_kv_caches(kv_caches)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """

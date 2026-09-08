@@ -44,6 +44,25 @@ PROMPTS = [
 SAMPLING_PARAMS = SamplingParams(temperature=0, max_tokens=20)
 
 
+def test_allocation_plan_reaches_every_connector():
+    """MultiConnector must preserve resolved page geometry during registration."""
+    from vllm.v1.kv_cache_interface import KVCacheAllocationPlan
+
+    connector = MultiConnector.__new__(MultiConnector)
+    first = MagicMock(spec_set=KVConnectorBase_V1)
+    second = MagicMock(spec_set=KVConnectorBase_V1)
+    first.requires_uniform_transfer_split = False
+    second.requires_uniform_transfer_split = True
+    connector._connectors = [first, second]
+    plan = KVCacheAllocationPlan((64, 128), 2)
+    caches = {"layer": torch.empty(0)}
+
+    assert connector.requires_uniform_transfer_split
+    connector.register_kv_cache_layout(caches, plan)
+    first.register_kv_cache_layout.assert_called_once_with(caches, plan)
+    second.register_kv_cache_layout.assert_called_once_with(caches, plan)
+
+
 # Test connector with custom stats for testing MultiConnector
 class MockConnectorStats(KVConnectorStats):
     """Mock stats class for testing."""

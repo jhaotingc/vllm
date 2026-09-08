@@ -244,6 +244,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return ret
 
+    @property
+    def requires_uniform_transfer_split(self) -> bool:
+        return any(c.requires_uniform_transfer_split for c in self._connectors)
+
+    def register_kv_cache_layout(self, kv_caches, allocation_plan) -> None:
+        for connector in self._connectors:
+            connector.register_kv_cache_layout(kv_caches, allocation_plan)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         for c in self._connectors:
             c.register_kv_caches(kv_caches)

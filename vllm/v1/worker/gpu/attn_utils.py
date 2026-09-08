@@ -128,7 +128,13 @@ def init_attn_backend(
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
-    kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+    if active_layer_names is not None:
+        assert kv_cache_config.allocation_plan is not None
+        kernel_block_sizes = list(kv_cache_config.allocation_plan.kernel_block_sizes)
+    else:
+        kernel_block_sizes = prepare_kernel_block_sizes(
+            kv_cache_config, attn_groups, vllm_config
+        )
 
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None

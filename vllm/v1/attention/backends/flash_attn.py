@@ -5,7 +5,7 @@
 import copy
 import functools
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -20,7 +20,9 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
+    AttentionKernel,
     AttentionType,
+    KernelPageRequirements,
     MultipleOf,
 )
 from vllm.v1.attention.backends.fa_utils import (
@@ -135,21 +137,23 @@ class FlashAttentionBackend(AttentionBackend):
         return None
 
     @classmethod
+    def create_kernel(cls, *args: Any, **kwargs: Any) -> AttentionKernel:
+        impl = cls.get_impl_cls()(*args, **kwargs)
+        assert isinstance(impl, FlashAttentionImpl)
+        if impl.uses_sm90_fa4_fp8_kv_dequant:
+            sizes: tuple[int | MultipleOf, ...] = (64,)
+        elif impl.fa4_hd256:
+            sizes = (FA4_HD256_PAGE_SIZE,)
+        else:
+            sizes = (MultipleOf(16),)
+        return AttentionKernel(impl, KernelPageRequirements(sizes))
+
+    @classmethod
     def get_supported_kernel_block_sizes(cls) -> list[int | MultipleOf]:
         if block_size := cls._get_sm90_fa4_fp8_kv_block_size():
             return [block_size]
         if block_size := cls._get_fa4_hd256_block_size():
             # Sliding-window specs select the smallest advertised size.
-            return [block_size]
-        return [MultipleOf(16)]
-
-    @classmethod
-    def get_supported_kernel_block_sizes_for_config(
-        cls, vllm_config: VllmConfig
-    ) -> list[int | MultipleOf]:
-        if block_size := cls._get_sm90_fa4_fp8_kv_block_size(vllm_config):
-            return [block_size]
-        if block_size := cls._get_fa4_hd256_block_size(vllm_config):
             return [block_size]
         return [MultipleOf(16)]
 
@@ -160,18 +164,6 @@ class FlashAttentionBackend(AttentionBackend):
         if block_size := cls._get_sm90_fa4_fp8_kv_block_size():
             return max(default_block_size, block_size)
         if block_size := cls._get_fa4_hd256_block_size():
-            return max(default_block_size, block_size)
-        if current_platform.is_xpu():
-            return max(default_block_size, 64)
-        return super().get_preferred_block_size(default_block_size)
-
-    @classmethod
-    def get_preferred_block_size_for_config(
-        cls, default_block_size: int, vllm_config: VllmConfig
-    ) -> int:
-        if block_size := cls._get_sm90_fa4_fp8_kv_block_size(vllm_config):
-            return max(default_block_size, block_size)
-        if block_size := cls._get_fa4_hd256_block_size(vllm_config):
             return max(default_block_size, block_size)
         if current_platform.is_xpu():
             return max(default_block_size, 64)
@@ -992,13 +984,13 @@ class FlashAttentionImpl(AttentionImpl):
         # FA4's SM90 FP8-KV path consumes native FP16/BF16 Q and dequantizes
         # FP8 K/V in-kernel. Other FA4 paths (notably SM100) still require Q,
         # K, and V to have the same FP8 dtype.
-        uses_sm90_fa4_fp8_kv_dequant = (
+        self.uses_sm90_fa4_fp8_kv_dequant = (
             self.vllm_flash_attn_version == 4
             and current_platform.is_device_capability_family(90)
             and self.kv_cache_dtype in ("fp8", "fp8_e4m3")
         )
         self.supports_quant_query_input = flash_attn_supports_quant_query_input() and (
-            not uses_sm90_fa4_fp8_kv_dequant
+            not self.uses_sm90_fa4_fp8_kv_dequant
         )
 
         dcp_a2a = (

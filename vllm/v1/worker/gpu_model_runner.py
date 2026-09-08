@@ -7518,7 +7518,7 @@ class GPUModelRunner(
         # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
         # tokens each.
         kernel_block_sizes = prepare_kernel_block_sizes(
-            kv_cache_config, self.attn_groups
+            kv_cache_config, self.attn_groups, self.vllm_config
         )
         self._kernel_block_sizes = kernel_block_sizes
 
@@ -7546,7 +7546,10 @@ class GPUModelRunner(
 
         if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
-            kv_transfer_group.register_kv_caches(kv_caches)
+            assert self.kv_cache_config.allocation_plan is not None
+            kv_transfer_group.register_kv_cache_layout(
+                kv_caches, self.kv_cache_config.allocation_plan
+            )
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
     def get_routed_experts(

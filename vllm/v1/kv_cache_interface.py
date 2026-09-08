@@ -1278,6 +1278,12 @@ class KVCacheGroupSpec:
     enable_kv_transfer: bool = True
 
 
+@dataclass(frozen=True)
+class KVCacheAllocationPlan:
+    kernel_block_sizes: tuple[int, ...]
+    transfer_block_ratio: int
+
+
 @dataclass
 class KVCacheConfig:
     """
@@ -1296,6 +1302,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    allocation_plan: KVCacheAllocationPlan | None = None
+    """Worker-resolved physical pages; independent of scheduler cache grouping."""
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None

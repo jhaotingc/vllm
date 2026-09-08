@@ -709,7 +709,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
-            self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            assert self.kv_cache_config.allocation_plan is not None
+            self.kv_connector = get_kv_connector(
+                self.vllm_config, kv_caches_dict, self.kv_cache_config.allocation_plan
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

@@ -230,6 +230,15 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Worker Side Methods
     ############################################################
+    @property
+    def requires_uniform_transfer_split(self) -> bool:
+        return True
+
+    def register_kv_cache_layout(self, kv_caches, allocation_plan) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.apply_allocation_plan(allocation_plan)
+        self.register_kv_caches(kv_caches)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)

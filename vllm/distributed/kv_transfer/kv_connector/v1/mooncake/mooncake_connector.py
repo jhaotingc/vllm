@@ -57,13 +57,13 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KpoolTailSpec,
+    KVCacheAllocationPlan,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
-from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
@@ -540,6 +540,15 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Worker Side Methods
     ############################################################
+    @property
+    def requires_uniform_transfer_split(self) -> bool:
+        return True
+
+    def register_kv_cache_layout(self, kv_caches, allocation_plan) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.apply_allocation_plan(allocation_plan)
+        self.register_kv_caches(kv_caches)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
@@ -1005,7 +1014,6 @@ class MooncakeConnectorWorker:
         self.kv_cache_config = kv_cache_config
         self.use_mla = self.model_config.use_mla
         self._physical_blocks_per_logical_kv_block = 1
-        self._sync_block_size_with_kernel()
 
         self.attn_backends = get_current_attn_backends(vllm_config)
         logger.debug(
@@ -1027,41 +1035,20 @@ class MooncakeConnectorWorker:
             for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
             for layer in group.layer_names
         }
-        self.transfer_topo = TransferTopology(
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            block_size=self.block_size,
-            engine_id=self.engine_id,
-            is_mla=self.use_mla,
-            is_mamba=kv_cache_config.has_mamba_layers,
-            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
-            attn_backends=self.attn_backends,
-        )
 
         self.async_zmq_ctx = zmq.asyncio.Context()
         self._encoder = msgspec.msgpack.Encoder()
         self._xfer_meta_decoder = msgspec.msgpack.Decoder(MooncakeXferMetadata)
         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
 
-    def _sync_block_size_with_kernel(self) -> None:
-        # When speculative decoding (e.g. Eagle) is enabled, the main model
-        # and draft model may use different attention backends with different
-        # physical block sizes. Pick the common (smallest) block size so that
-        # KV-cache registration and transfer work correctly for both models.
-        backends = get_current_attn_backends(self.vllm_config)
-        kernel_block_size = select_common_block_size(self.block_size, backends)
-        if self.block_size != kernel_block_size:
-            logger.info_once(
-                "User-specified logical block size (%s) does not match"
-                " physical kernel block size (%s). Using the latter.",
-                self.block_size,
-                kernel_block_size,
-            )
-            assert self.block_size > kernel_block_size
-            self._physical_blocks_per_logical_kv_block = (
-                self.block_size // kernel_block_size
-            )
-            self.block_size = kernel_block_size
+    def apply_allocation_plan(self, allocation_plan: KVCacheAllocationPlan) -> None:
+        self._physical_blocks_per_logical_kv_block = (
+            allocation_plan.transfer_block_ratio
+        )
+        self.block_size = (
+            self.vllm_config.cache_config.block_size
+            // allocation_plan.transfer_block_ratio
+        )
 
     def __del__(self):
         self.shutdown()
@@ -1635,6 +1622,16 @@ class MooncakeConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
+        self.transfer_topo = TransferTopology(
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            block_size=self.block_size,
+            engine_id=self.engine_id,
+            is_mla=self.use_mla,
+            is_mamba=self.kv_cache_config.has_mamba_layers,
+            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+            attn_backends=self.attn_backends,
+        )
 
         logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
 

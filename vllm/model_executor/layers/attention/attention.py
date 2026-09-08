@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -42,6 +43,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
@@ -99,8 +101,7 @@ def should_load_quant_weights(quant_method: QuantizeMethodBase | None) -> bool:
 
 
 def _largest_kernel_block_within(
-    attn_backend: "type[AttentionBackend]",
-    vllm_config: VllmConfig,
+    sizes: Sequence[int | MultipleOf],
     per_token_bytes: int,
     page_budget: int | None,
     fallback: int,
@@ -113,9 +114,6 @@ def _largest_kernel_block_within(
     Falls back to the smallest supported block when ``page_budget`` is None (no padding
     — the block is handled by ``unify``'s integer scaling instead) or nothing fits.
     """
-    from vllm.v1.attention.backend import MultipleOf
-
-    sizes = attn_backend.get_supported_kernel_block_sizes_for_config(vllm_config)
     candidates = [s for s in sizes if isinstance(s, int)]
     if not candidates:
         candidates = [s.base for s in sizes if isinstance(s, MultipleOf)]
@@ -415,8 +413,7 @@ class Attention(nn.Module, AttentionLayerBase):
             if block_n is not None:
                 extra_impl_args.setdefault("block_n", block_n)
 
-        impl_cls = self.attn_backend.get_impl_cls()
-        self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass
+        kernel = self.attn_backend.create_kernel(
             num_heads,
             head_size,
             scale,
@@ -429,6 +426,8 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        self.impl = kernel.impl  # type: ignore[assignment]
+        self.kernel_page_requirements = kernel.page_requirements
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -641,8 +640,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
             ).real_page_size_bytes
             sw_block_size = _largest_kernel_block_within(
-                self.attn_backend,
-                vllm_config,
+                self.kernel_page_requirements.supported_sizes,
                 sw_per_token,
                 shared_page,
                 block_size,
