@@ -895,6 +895,43 @@ def test_flashinfer_xqa_draft_masks():
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
+def test_flashinfer_mtp_prefill_metadata_pads_to_cudagraph_batch_size():
+    """Three MTP3 requests must safely replay the four-request graph."""
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    qo_indptr = torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, 2, 5, 8], dtype=torch.int32)
+    last_page_len = torch.tensor([16, 7, 3], dtype=torch.int32)
+
+    graph_num_reqs = flashinfer_backend._get_native_prefill_cudagraph_batch_size(
+        qo_indptr,
+        num_prefills=3,
+        num_actual_tokens=16,
+        uniform_decode_query_len=4,
+        max_cudagraph_tokens=256,
+    )
+    assert graph_num_reqs == 4
+
+    padded_qo, padded_kv, padded_last_page_len = (
+        flashinfer_backend._pad_native_prefill_metadata_for_cudagraph(
+            qo_indptr, kv_indptr, last_page_len, graph_num_reqs
+        )
+    )
+    torch.testing.assert_close(
+        padded_qo, torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        padded_kv, torch.tensor([0, 2, 5, 8, 8], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        padded_last_page_len, torch.tensor([16, 7, 3, 0], dtype=torch.int32)
+    )
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
 def test_flashinfer_xqa_query_lens_preserve_cudagraph_padding():
     """CUDA-graph padding stays as zero-length requests in ragged offsets."""
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend

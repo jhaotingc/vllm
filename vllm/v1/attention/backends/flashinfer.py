@@ -680,6 +680,60 @@ class FlashInferMetadata:
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
 
+def _get_native_prefill_cudagraph_batch_size(
+    qo_indptr_cpu: torch.Tensor,
+    num_prefills: int,
+    num_actual_tokens: int,
+    uniform_decode_query_len: int,
+    max_cudagraph_tokens: int,
+) -> int | None:
+    """Return the graph request count for uniform speculative verification."""
+    if (
+        uniform_decode_query_len <= 1
+        or num_actual_tokens % uniform_decode_query_len != 0
+        or num_actual_tokens > max_cudagraph_tokens
+    ):
+        return None
+
+    query_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+    if query_lens.numel() != num_prefills or not bool(
+        (query_lens == uniform_decode_query_len).all().item()
+    ):
+        return None
+
+    graph_num_reqs = num_actual_tokens // uniform_decode_query_len
+    return graph_num_reqs if graph_num_reqs >= num_prefills else None
+
+
+def _pad_native_prefill_metadata_for_cudagraph(
+    qo_indptr_cpu: torch.Tensor,
+    paged_kv_indptr_cpu: torch.Tensor,
+    paged_kv_last_page_len_cpu: torch.Tensor,
+    graph_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Append empty requests so FlashInfer metadata matches the captured graph."""
+    num_reqs = paged_kv_last_page_len_cpu.numel()
+    padding = graph_num_reqs - num_reqs
+    if padding <= 0:
+        return qo_indptr_cpu, paged_kv_indptr_cpu, paged_kv_last_page_len_cpu
+
+    qo_indptr_cpu = torch.cat([qo_indptr_cpu, qo_indptr_cpu[-1:].expand(padding)])
+    paged_kv_indptr_cpu = torch.cat(
+        [paged_kv_indptr_cpu, paged_kv_indptr_cpu[-1:].expand(padding)]
+    )
+    paged_kv_last_page_len_cpu = torch.cat(
+        [
+            paged_kv_last_page_len_cpu,
+            torch.zeros(
+                padding,
+                dtype=paged_kv_last_page_len_cpu.dtype,
+                device=paged_kv_last_page_len_cpu.device,
+            ),
+        ]
+    )
+    return qo_indptr_cpu, paged_kv_indptr_cpu, paged_kv_last_page_len_cpu
+
+
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
@@ -740,12 +794,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._decode_wrappers_cudagraph: dict[
                 int, BatchDecodeWithPagedKVCacheWrapper
             ] = {}
+            self._prefill_wrappers_cudagraph: dict[
+                int, BatchPrefillWithPagedKVCacheWrapper
+            ] = {}
             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
                 self._decode_cudagraph_max_bs = min(
                     self._decode_cudagraph_max_bs,
                     self.compilation_config.max_cudagraph_capture_size,
                 )
+        self.uniform_decode_query_len = 1 + num_spec_tokens
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -979,9 +1037,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
-        """Get the cudagraph support level for FlashInfer attention."""
+        """Get the cudagraph support level for FlashInfer attention.
+
+        SM90 XQA supports only single-token decode. SM12x uses the dedicated
+        XQA API, which supports speculative and non-causal decode.
+        """
         # XQA lacks LSE for DCP; DCP also cannot graph variable-length trtllm-gen.
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+        # SM80 native paged prefill uses graph-owned metadata buffers below, so
+        # uniform multi-token speculative decode is safe to capture and replay.
+        if current_platform.is_device_capability(80):
+            return AttentionCGSupport.UNIFORM_BATCH
+
+        if current_platform.is_device_capability(90):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         kv_specs = iter_layer_specs(kv_cache_spec)
@@ -1123,7 +1193,40 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(
         self,
         causal: bool = True,
+        cudagraph_batch_size: int | None = None,
     ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+        if cudagraph_batch_size is not None:
+            assert causal
+            assert not self.use_dcp
+            assert self.enable_cuda_graph
+            wrapper = self._prefill_wrappers_cudagraph.get(cudagraph_batch_size)
+            if wrapper is None:
+                qo_indptr_buf = torch.empty(
+                    cudagraph_batch_size + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                paged_kv_indptr_buf = torch.empty_like(qo_indptr_buf)
+                paged_kv_last_page_len_buf = torch.empty(
+                    cudagraph_batch_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    self._get_workspace_buffer(),
+                    get_flashinfer_layout_string(self.kv_cache_layout),
+                    use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr_buf,
+                    paged_kv_indptr_buf=paged_kv_indptr_buf,
+                    # This builder-owned allocation has a stable address and
+                    # is sized for the maximum number of pages.
+                    paged_kv_indices_buf=self.paged_kv_indices,
+                    paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
+                    backend="auto",
+                )
+                self._prefill_wrappers_cudagraph[cudagraph_batch_size] = wrapper
+            return wrapper
+
         if not causal:
             if self.use_dcp:
                 raise NotImplementedError(
@@ -1528,6 +1631,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Step 3: Handle prefill and decode pathways case by case
         ## PREFILL PATHWAY
         if num_prefills > 0:
+            native_prefill_cudagraph_batch_size = None
+            if (
+                self.enable_cuda_graph
+                and current_platform.is_device_capability(80)
+                and attn_metadata.causal
+                and num_decodes == 0
+                and not prefill_use_trtllm
+                and self.uniform_decode_query_len > 1
+                and num_actual_tokens % self.uniform_decode_query_len == 0
+                and num_actual_tokens <= self._decode_cudagraph_max_bs
+            ):
+                native_prefill_cudagraph_batch_size = (
+                    _get_native_prefill_cudagraph_batch_size(
+                        qo_indptr_cpu,
+                        num_prefills,
+                        num_actual_tokens,
+                        self.uniform_decode_query_len,
+                        self._decode_cudagraph_max_bs,
+                    )
+                )
+
             # Slices for shared prefill metadata
             prefill_start = num_decodes
             qo_indptr_prefill_cpu = (
@@ -1572,7 +1696,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                prefill_wrapper = self._get_prefill_wrapper(
+                    causal=attn_metadata.causal,
+                    cudagraph_batch_size=native_prefill_cudagraph_batch_size,
+                )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1582,6 +1709,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
+                if (
+                    native_prefill_cudagraph_batch_size is not None
+                    and native_prefill_cudagraph_batch_size > num_prefills
+                ):
+                    (
+                        qo_indptr_prefill_cpu,
+                        paged_kv_indptr_prefill_cpu,
+                        paged_kv_last_page_len_prefill_cpu,
+                    ) = _pad_native_prefill_metadata_for_cudagraph(
+                        qo_indptr_prefill_cpu,
+                        paged_kv_indptr_prefill_cpu,
+                        paged_kv_last_page_len_prefill_cpu,
+                        native_prefill_cudagraph_batch_size,
+                    )
                 # plan() copies these to the GPU with non_blocking=True;
                 # stage them in pinned memory so the copies stay async
                 # (the reused buffers themselves are intentionally not pinned).
@@ -2093,6 +2234,16 @@ class FlashInferImpl(AttentionImpl):
         # because some decode requests may have more than one query token.
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
+        if isinstance(attn_metadata.prefill, FIPrefill):
+            # FULL CUDA graphs can pad the physical query buffer without adding
+            # a corresponding query segment. The same target metadata is reused
+            # by an eager speculator, so trim only the eager FlashInfer prefill
+            # view to the logical length that its wrapper planned.
+            prefill_wrapper = attn_metadata.prefill.wrapper
+            if isinstance(prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper):
+                num_prefill_tokens = min(
+                    num_prefill_tokens, prefill_wrapper._qo_indptr_last
+                )
 
         stride_order = self.kv_cache_layout.layer_view_order
         kv_cache_permute = kv_cache.permute(*stride_order)  # HND and contiguous
@@ -2140,7 +2291,8 @@ class FlashInferImpl(AttentionImpl):
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
-            prefill_query = query[num_decode_tokens:]
+            prefill_end = num_decode_tokens + num_prefill_tokens
+            prefill_query = query[num_decode_tokens:prefill_end]
             assert prefill_query.shape[0] == num_prefill_tokens
 
             # Convert query to the expected dtype for prefill if needed.
@@ -2177,9 +2329,9 @@ class FlashInferImpl(AttentionImpl):
                         layer,
                         prefill_query,
                         kv_cache_tuple,
-                        key[num_decode_tokens:num_actual_tokens],
-                        value[num_decode_tokens:num_actual_tokens],
-                        out=output[num_decode_tokens:],
+                        key[num_decode_tokens:prefill_end],
+                        value[num_decode_tokens:prefill_end],
+                        out=output[num_decode_tokens:prefill_end],
                     )
                 else:
                     assert isinstance(
@@ -2209,7 +2361,7 @@ class FlashInferImpl(AttentionImpl):
                     if needs_fp8_out_prefill:
                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
                     else:
-                        out_prefill = output[num_decode_tokens:]
+                        out_prefill = output[num_decode_tokens:prefill_end]
 
                     if isinstance(
                         prefill_wrapper, BatchAttentionWithAttentionSinkWrapper
