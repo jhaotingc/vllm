@@ -155,6 +155,56 @@ def _make_xqa_ragged_draft_block_mask(
     return _pack_draft_block_bool_mask(bool_mask, num_packed)
 
 
+def _make_variable_window_bounds(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    causal: torch.Tensor,
+    window_left: int,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build inclusive per-token KV bounds for mixed-causal TRTLLM context.
+
+    Query tokens are packed by request. ``seq_lens`` includes the current query
+    tokens, so each query's absolute position starts at ``seq_len - q_len``.
+    For bidirectional requests a sliding window is symmetric, matching the
+    semantics used by DiffusionGemma's FlashAttention reference path.
+    """
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    request_indices = torch.repeat_interleave(
+        torch.arange(
+            query_lens.shape[0],
+            dtype=torch.int32,
+            device=query_start_loc.device,
+        ),
+        query_lens,
+        output_size=num_tokens,
+    )
+    token_indices = torch.arange(
+        num_tokens,
+        dtype=torch.int32,
+        device=query_start_loc.device,
+    )
+    query_positions = (
+        seq_lens[request_indices]
+        - query_lens[request_indices]
+        + token_indices
+        - query_start_loc[request_indices]
+    )
+    token_seq_lens = seq_lens[request_indices]
+    token_causal = causal[request_indices]
+
+    if window_left < 0:
+        starts = torch.zeros_like(query_positions)
+        bidirectional_ends = token_seq_lens - 1
+    else:
+        starts = torch.clamp(query_positions - window_left, min=0)
+        bidirectional_ends = torch.minimum(
+            query_positions + window_left, token_seq_lens - 1
+        )
+    ends = torch.where(token_causal, query_positions, bidirectional_ends)
+    return starts.contiguous(), ends.contiguous()
+
+
 @triton.jit
 def _trtllm_prefill_attn_kvfp8_dequant(
     kv_cache_ptr,
@@ -597,6 +647,9 @@ class TRTLLMPrefill:
     max_seq_len: int
     """The maximum sequence length for KV Cache."""
 
+    variable_window_bounds: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+    """Inclusive per-token KV bounds, keyed by the layer's window_left."""
+
 
 @dataclass
 class FlashInferTrtllmAPIDecode:
@@ -646,7 +699,7 @@ class FlashInferMetadata:
     num_decode_tokens: int
     num_prefills: int
     num_prefill_tokens: int
-    causal: bool
+    causal: bool | torch.Tensor
 
     prefill: FIPrefill | TRTLLMPrefill | None
     """
@@ -894,6 +947,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "backend."
             )
         self.global_hyperparameters = infer_global_hyperparameters(per_layer_parameters)
+        self.window_lefts = {
+            params.window_left for params in per_layer_parameters.values()
+        }
         self.sm_scale = self.global_hyperparameters.sm_scale
         self.window_left = self.global_hyperparameters.window_left
         self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
@@ -1293,7 +1349,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
-        route_decode = causal or self.use_dedicated_xqa
+        dynamic_causal = isinstance(causal, torch.Tensor)
+        route_decode = not dynamic_causal and (causal or self.use_dedicated_xqa)
         if route_decode:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
@@ -1319,13 +1376,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
-        use_cascade = common_prefix_len > 0
+        # Mixed-causal batches need a single variable-window context launch.
+        # The full block tables already contain any cached common prefix.
+        use_cascade = common_prefix_len > 0 and not dynamic_causal
         uses_spec_reorder = self.reorder_batch_threshold > 1
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
+        prefill_use_trtllm = (dynamic_causal or causal) and use_trtllm_attention(
             self.num_qo_heads,
             self.num_kv_heads,
             num_prefill_tokens,
@@ -1338,21 +1397,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        decode_with_flashinfer_trtllm_api = self.use_trtllm_decode_attention and (
-            causal or self.use_dedicated_xqa
+        if dynamic_causal and not prefill_use_trtllm:
+            raise NotImplementedError(
+                "FlashInfer mixed causal/bidirectional attention requires the "
+                "TRTLLM context kernel."
+            )
+        decode_with_flashinfer_trtllm_api = (
+            not dynamic_causal
+            and self.use_trtllm_decode_attention
+            and (causal or self.use_dedicated_xqa)
         )
 
-        if not causal and self.use_dcp:
+        if dynamic_causal and self.use_dcp:
+            raise NotImplementedError(
+                "FlashInfer mixed causal/bidirectional attention is not supported "
+                "with DCP yet."
+            )
+        if not dynamic_causal and not causal and self.use_dcp:
             raise NotImplementedError(
                 "FlashInfer non-causal prefill is not supported with DCP yet."
             )
-        if not causal and self.use_trtllm_decode_attention:
+        if not dynamic_causal and not causal and self.use_trtllm_decode_attention:
             logger.warning_once(
                 "Using FlashInfer for draft model non-causal attention; TRTLLM "
                 "can still be used for target model causal attention."
             )
-        all_uses_trtllm = causal and (
-            (num_prefills == 0 or prefill_use_trtllm)
+        all_uses_trtllm = dynamic_causal or (
+            causal
+            and (num_prefills == 0 or prefill_use_trtllm)
             and (num_decodes == 0 or decode_with_flashinfer_trtllm_api)
         )
 
@@ -1554,6 +1626,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
                 )
                 max_q_len_prefill = int(query_lens_prefill_cpu.max().item())
+                variable_window_bounds = None
+                if dynamic_causal:
+                    assert isinstance(causal, torch.Tensor)
+                    variable_window_bounds = {
+                        window_left: _make_variable_window_bounds(
+                            qo_indptr_prefill_gpu,
+                            prefill_seq_lens,
+                            causal[prefill_start:],
+                            window_left,
+                            num_prefill_tokens,
+                        )
+                        for window_left in self.window_lefts
+                    }
                 attn_metadata.prefill = TRTLLMPrefill(
                     block_tables=block_table_tensor[prefill_start:],
                     seq_lens=prefill_seq_lens,
@@ -1561,6 +1646,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     cum_seq_lens_kv=paged_kv_indptr_prefill_gpu,
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
+                    variable_window_bounds=variable_window_bounds,
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -2308,6 +2394,17 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
 
+                variable_window_bounds = attn_metadata.prefill.variable_window_bounds
+                variable_window_starts = None
+                variable_window_ends = None
+                trtllm_window_left = self.window_left
+                trtllm_window_right = -1
+                if variable_window_bounds is not None:
+                    variable_window_starts, variable_window_ends = (
+                        variable_window_bounds[self.window_left]
+                    )
+                    trtllm_window_left = -1
+
                 trtllm_batch_context_with_kv_cache(
                     query=prefill_query,
                     kv_cache=mock_kv_cache,
@@ -2321,7 +2418,10 @@ class FlashInferImpl(AttentionImpl):
                     batch_size=attn_metadata.num_prefills,
                     cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
                     cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
-                    window_left=self.window_left,
+                    window_left=trtllm_window_left,
+                    window_right=trtllm_window_right,
+                    variable_window_token_starts=variable_window_starts,
+                    variable_window_token_ends=variable_window_ends,
                     sinks=self.sinks,
                     o_sf_scale=self.o_sf_scale,
                     out=out,
