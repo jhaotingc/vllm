@@ -7,6 +7,10 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.nano35_cadence_scheduler import (
+    Nano35Cadence8Scheduler,
+    Nano35CadenceScheduler,
+)
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -811,3 +815,61 @@ def test_resumable_request_handoff():
 
     engine._process_oldest_step()
     assert len(request.output_token_ids) == 1
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls", [Nano35CadenceScheduler, Nano35Cadence8Scheduler]
+)
+def test_prefill_cadence_keeps_decodes_running(scheduler_cls):
+    """A waiting prefill joins on cadence while existing decodes keep progressing."""
+    scheduler = create_scheduler(async_scheduling=True, scheduler_cls=scheduler_cls)
+    decode, prefill = create_requests(num_requests=2, num_tokens=4, max_tokens=64)
+    scheduler.add_request(decode)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+    scheduler.add_request(prefill)
+
+    for _ in range(scheduler_cls.prefill_interval - 1):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {decode.request_id: 1}
+        scheduler.update_from_output(output, _make_model_runner_output(output))
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {
+        decode.request_id: 1,
+        prefill.request_id: prefill.num_prompt_tokens,
+    }
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls", [Nano35CadenceScheduler, Nano35Cadence8Scheduler]
+)
+def test_prefill_cadence_honors_explicit_throttle(scheduler_cls):
+    """An aligned step must still honor a throttle requested by the caller."""
+    scheduler = create_scheduler(async_scheduling=True, scheduler_cls=scheduler_cls)
+    decode, prefill = create_requests(num_requests=2, num_tokens=4, max_tokens=64)
+    scheduler.add_request(decode)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+    scheduler.add_request(prefill)
+    scheduler.current_step = scheduler_cls.prefill_interval
+
+    output = scheduler.schedule(throttle_prefills=True)
+    assert output.num_scheduled_tokens == {decode.request_id: 1}
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls", [Nano35CadenceScheduler, Nano35Cadence8Scheduler]
+)
+def test_prefill_cadence_does_not_stall_prefill_only_batches(scheduler_cls):
+    """Cadence throttling must preserve progress when there are no decodes."""
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        scheduler_cls=scheduler_cls,
+        max_num_batched_tokens=16,
+        max_model_len=64,
+    )
+    (prefill,) = create_requests(num_requests=1, num_tokens=32, max_tokens=4)
+    scheduler.add_request(prefill)
+    assert scheduler.schedule().num_scheduled_tokens == {prefill.request_id: 16}
+    assert scheduler.schedule().num_scheduled_tokens == {prefill.request_id: 16}
