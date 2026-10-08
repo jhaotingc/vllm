@@ -44,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.ssd_checkpoint import store_prefill_ch
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
+from vllm.model_executor.layers.mamba.ops.ssd_graph import get_ssd_graph_cache
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     commit_replayssm_ring_trackers,
     reset_replayssm_ring_trackers,
@@ -869,6 +870,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
+                graph_cache=get_ssd_graph_cache(hidden_states_p),
             )
 
             # update ssm states

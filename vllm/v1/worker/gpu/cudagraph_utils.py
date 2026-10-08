@@ -33,6 +33,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.ssd_graph import suspend_ssd_graph_cache
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -432,7 +433,11 @@ class CudaGraphManager:
             progress_bar_desc: Description shown on the capture progress bar.
 
         """
-        with graph_capture(device=self.device), ExitStack() as stack:
+        with (
+            graph_capture(device=self.device),
+            ExitStack() as stack,
+            suspend_ssd_graph_cache(),
+        ):
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
                 stack.callback(self.ubatch_runner.abort_pending_run)

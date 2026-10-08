@@ -174,6 +174,7 @@ def mamba_chunk_scan_combined_varlen(
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
     state_dtype=None,
+    graph_cache=None,
 ):
     """Argument:
         x: (seqlen, nheads, headdim)
@@ -200,6 +201,29 @@ def mamba_chunk_scan_combined_varlen(
     assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
     assert seq_idx is not None
 
+    if graph_cache is not None:
+        return graph_cache.run(
+            _mamba_chunk_scan_combined_fwd,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            out,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            return_intermediate_states=return_intermediate_states,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            state_dtype=state_dtype,
+        )
     varlen_states = _mamba_chunk_scan_combined_fwd(
         x,
         dt,
