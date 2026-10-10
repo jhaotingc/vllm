@@ -140,6 +140,10 @@ class Mamba2AttentionMetadataBuilder(
         self.checkpoint_builder = MambaPrefillCheckpointBuilder(
             vllm_config, kv_cache_spec
         )
+        if self.use_spec_decode:
+            self.supports_update_block_table = (
+                vllm_config.use_v2_model_runner and device.type == "cuda"
+            )
 
     def build(
         self,
