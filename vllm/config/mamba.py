@@ -31,6 +31,7 @@ class MambaBackendEnum(Enum, metaclass=_MambaBackendEnumMeta):
 
 
 MambaSSUAlgorithm = Literal["auto", "simple", "vertical", "horizontal"]
+MambaSSDBackend = Literal["triton", "flashinfer"]
 
 
 @config
@@ -54,6 +55,13 @@ class MambaConfig:
     None defaults to FlashInfer's "auto" algorithm. Forced algorithms must
     be supported by FlashInfer for the active GPU, state dtype, and decoding
     mode."""
+
+    ssd_backend: MambaSSDBackend = "triton"
+    """Kernel backend for the chunked SSD scan of Mamba2 prefills. "triton"
+    runs vLLM's five Triton kernels; "flashinfer" runs FlashInfer's fused SSD
+    scan (two launches; datacenter Blackwell, bfloat16 activations, head dim
+    64, state size 128). Prefills that store Mamba checkpoints keep the
+    Triton scan."""
 
     @field_validator("backend", mode="before")
     @classmethod
@@ -80,8 +88,26 @@ class MambaConfig:
                 "or omit `--mamba-ssu-algorithm`."
             )
 
+    def validate_ssd_backend(self) -> None:
+        valid_backends = get_args(MambaSSDBackend)
+        if self.ssd_backend not in valid_backends:
+            valid = ", ".join(valid_backends)
+            raise ValueError(
+                f"Unknown Mamba SSD backend: '{self.ssd_backend}'. "
+                f"Valid options are: {valid}"
+            )
+        if self.ssd_backend == "flashinfer":
+            from vllm.platforms import current_platform
+
+            if not current_platform.is_device_capability_family(100):
+                raise ValueError(
+                    "--mamba-ssd-backend flashinfer requires a datacenter "
+                    "Blackwell GPU (SM100/SM103)."
+                )
+
     def __post_init__(self):
         self.validate_ssu_algorithm()
+        self.validate_ssd_backend()
         if self.enable_stochastic_rounding:
             from vllm.platforms import current_platform
 

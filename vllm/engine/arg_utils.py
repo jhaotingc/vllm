@@ -89,7 +89,11 @@ from vllm.config.kernel import (
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.logging import LogLevel
 from vllm.config.lora import MaxLoRARanks
-from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
+from vllm.config.mamba import (
+    MambaBackendEnum,
+    MambaSSDBackend,
+    MambaSSUAlgorithm,
+)
 from vllm.config.model import (
     ConvertOption,
     HfOverrides,
@@ -798,6 +802,7 @@ class EngineArgs:
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
+    mamba_ssd_backend: MambaSSDBackend = MambaConfig.ssd_backend
     enable_mamba_cache_stochastic_rounding: bool = (
         MambaConfig.enable_stochastic_rounding
     )
@@ -1083,6 +1088,7 @@ class EngineArgs:
         mamba_group.add_argument(
             "--mamba-ssu-algorithm", **mamba_kwargs["ssu_algorithm"]
         )
+        mamba_group.add_argument("--mamba-ssd-backend", **mamba_kwargs["ssd_backend"])
         mamba_group.add_argument(
             "--enable-mamba-cache-stochastic-rounding",
             **mamba_kwargs["enable_stochastic_rounding"],
@@ -2701,6 +2707,7 @@ class EngineArgs:
             mamba_config.backend = self.mamba_backend
         if self.mamba_ssu_algorithm is not None:
             mamba_config.ssu_algorithm = self.mamba_ssu_algorithm
+        mamba_config.ssd_backend = self.mamba_ssd_backend
         if self.enable_mamba_cache_stochastic_rounding:
             mamba_config.enable_stochastic_rounding = (
                 self.enable_mamba_cache_stochastic_rounding
@@ -2710,6 +2717,7 @@ class EngineArgs:
                 self.mamba_cache_philox_rounds
             )
         mamba_config.validate_ssu_algorithm()
+        mamba_config.validate_ssd_backend()
 
         # Kernel config overrides
         kernel_config = copy.deepcopy(self.kernel_config)
