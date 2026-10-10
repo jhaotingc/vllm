@@ -63,6 +63,17 @@ class MambaConfig:
     64, state size 128). Prefills that store Mamba checkpoints keep the
     Triton scan."""
 
+    mixed_batch_cudagraph: bool = False
+    """Capture the Mamba2 mixer (causal conv1d, SSD scan and decode state
+    update) inside the piecewise CUDA graphs that run prefill and mixed
+    prefill/decode batches, instead of running it eagerly between graph
+    pieces. The mixer then uses shapes fixed by the padded token count, with
+    its per-step metadata in persistent buffers, so the cost is padded GPU
+    work instead of per-launch host time. Requires the V2 model runner,
+    `--use-replayssm --mamba-backend flashinfer` and `--mamba-cache-mode
+    none` without prefill checkpoints; the captured scan always uses the
+    Triton SSD kernels."""
+
     @field_validator("backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:

@@ -56,6 +56,7 @@ def _chunk_cumsum_fwd_kernel(
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    HAS_PAD_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
@@ -66,6 +67,10 @@ def _chunk_cumsum_fwd_kernel(
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    # Static-shape launches end with unused chunks, marked by a negative end
+    # boundary.
+    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
+        return
 
     dt_ptr += chunk_seqlen_start * stride_dt_seqlen
     dt_out_ptr += pid_c * stride_dt_out_chunk
@@ -227,6 +232,7 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_chunk: tl.int64,
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
+    HAS_PAD_CHUNKS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -238,6 +244,10 @@ def _chunk_state_fwd_kernel(
     pid_n = tl.program_id(axis=0) % num_pid_n
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    # Static-shape launches end with unused chunks, marked by a negative end
+    # boundary.
+    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
+        return
     b_ptr += (
         chunk_seqlen_start * stride_b_seqlen
         + (pid_h // nheads_ngroups_ratio) * stride_b_head
@@ -311,6 +321,7 @@ def _chunk_cumsum_fwd(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    has_pad_chunks=False,
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
@@ -357,13 +368,21 @@ def _chunk_cumsum_fwd(
         stride_dA_cs_csize=dA_cumsum.stride(2),
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,
+        HAS_PAD_CHUNKS=has_pad_chunks,
         BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
     )
     return dA_cumsum, dt_out
 
 
 def _chunk_state_fwd(
-    B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    states=None,
+    states_in_fp32=True,
+    has_pad_chunks=False,
 ):
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -427,5 +446,6 @@ def _chunk_state_fwd(
         stride_dA_cs_head=dA_cumsum.stride(0),
         stride_dA_cs_chunk=dA_cumsum.stride(1),
         stride_dA_cs_csize=dA_cumsum.stride(2),
+        HAS_PAD_CHUNKS=has_pad_chunks,
     )
     return states

@@ -2183,6 +2183,8 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+        if self.mamba_config.mixed_batch_cudagraph:
+            self._capture_mamba_mixer2_in_piecewise_cudagraphs()
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism, native rms norm tracing errors due to
@@ -3531,6 +3533,35 @@ class VllmConfig:
                 "--mamba-block-size can only be set with --enable-prefix-caching"
             )
         return self
+
+    def _capture_mamba_mixer2_in_piecewise_cudagraphs(self) -> None:
+        """MambaConfig.mixed_batch_cudagraph: keep vllm::mamba_mixer2 inside
+        the piecewise CUDA graphs, where it runs its static-shape path."""
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                "--mamba-mixed-batch-cudagraph requires the V2 model runner"
+            )
+        if not (
+            self.cache_config.use_replayssm
+            and self.mamba_config.backend == MambaBackendEnum.FLASHINFER
+        ):
+            raise ValueError(
+                "--mamba-mixed-batch-cudagraph requires --use-replayssm "
+                "--mamba-backend flashinfer"
+            )
+        if (
+            self.cache_config.mamba_cache_mode != "none"
+            or self.cache_config.enable_mamba_shared_prefix_checkpoint
+        ):
+            raise ValueError(
+                "--mamba-mixed-batch-cudagraph requires --mamba-cache-mode none "
+                "without prefill checkpoints"
+            )
+        splitting_ops = self.compilation_config.splitting_ops
+        if splitting_ops and "vllm::mamba_mixer2" in splitting_ops:
+            self.compilation_config.splitting_ops = [
+                op for op in splitting_ops if op != "vllm::mamba_mixer2"
+            ]
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":

@@ -14,7 +14,7 @@ from vllm.triton_utils import triton
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
-from .ssd_state_passing import _state_passing_fwd
+from .ssd_state_passing import _state_passing_fwd, _write_final_states
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
@@ -45,6 +45,9 @@ def _mamba_chunk_scan_combined_fwd(
     state_dtype=None,
     final_states_out=None,
     final_state_indices=None,
+    initial_state_indices=None,
+    has_initial_states=None,
+    has_pad_chunks=False,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -76,8 +79,11 @@ def _mamba_chunk_scan_combined_fwd(
         D = D.contiguous()
     assert cu_seqlens is not None, "Assuming varlen input - must supply cu_seqlens"
 
-    if initial_states is not None:
+    if initial_states is not None and initial_state_indices is None:
         assert initial_states.shape == (len(cu_seqlens) - 1, nheads, headdim, dstate)
+    elif initial_states is not None:
+        assert initial_states.shape[1:] == (nheads, headdim, dstate)
+        assert has_initial_states is not None
 
     # This function executes 5 sub-functions for computing mamba
     # - a good resource is the blog https://goombalab.github.io/blog/2024/mamba2-part3-algorithm/
@@ -98,13 +104,24 @@ def _mamba_chunk_scan_combined_fwd(
         dt_bias=dt_bias,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
+        has_pad_chunks=has_pad_chunks,
     )
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
     states = _chunk_state_fwd(
-        B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        cu_chunk_seqlens,
+        states_in_fp32=True,
+        has_pad_chunks=has_pad_chunks,
     )
+
+    # Initial states read from the state cache share their slots with the
+    # final states, so those are written only after the chunk scan below.
+    fuse_final_states = final_states_out is not None and initial_state_indices is None
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
@@ -119,14 +136,23 @@ def _mamba_chunk_scan_combined_fwd(
         else None,  # (batch, nheads, headdim*dstate)
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
         final_states=final_states_out.flatten(-2)
-        if final_states_out is not None
+        if fuse_final_states
         else None,  # (num_slots, nheads, headdim*dstate)
-        final_state_indices=final_state_indices,
+        final_state_indices=final_state_indices if fuse_final_states else None,
+        initial_state_indices=initial_state_indices,
+        has_initial_states=has_initial_states,
     )
     states = states.unflatten(-1, (headdim, dstate))
 
     # 4. Compute batched matrix multiply for C_j^T B_i terms
-    CB = _bmm_chunk_fwd(C, B, chunk_size, cu_chunk_seqlens, output_dtype=torch.float32)
+    CB = _bmm_chunk_fwd(
+        C,
+        B,
+        chunk_size,
+        cu_chunk_seqlens,
+        output_dtype=torch.float32,
+        has_pad_chunks=has_pad_chunks,
+    )
 
     # 5. Scan and compute the diagonal blocks, taking into
     #    account past causal states.
@@ -151,7 +177,18 @@ def _mamba_chunk_scan_combined_fwd(
         D=D,
         z=z,
         initial_states=initial_states,
+        initial_state_indices=initial_state_indices,
+        has_initial_states=has_initial_states,
+        has_pad_chunks=has_pad_chunks,
     )
+
+    if final_states_out is not None and not fuse_final_states:
+        _write_final_states(
+            states.flatten(-2),
+            last_chunk_indices,
+            final_states_out.flatten(-2),
+            final_state_indices,
+        )
 
     if return_intermediate_states:
         return states
@@ -183,6 +220,9 @@ def mamba_chunk_scan_combined_varlen(
     state_dtype=None,
     final_states_out=None,
     final_state_indices=None,
+    initial_state_indices=None,
+    has_initial_states=None,
+    has_pad_chunks=False,
 ):
     """Argument:
         x: (seqlen, nheads, headdim)
@@ -205,6 +245,14 @@ def mamba_chunk_scan_combined_varlen(
         state_dtype: The data type of the ssm state
         final_states_out: (num_slots, nheads, headdim, dstate) state cache
         final_state_indices: (batch,) slot receiving each final state
+            (negative: no write)
+        initial_state_indices: (batch,) if given, initial_states is the
+            (num_slots, nheads, headdim, dstate) state cache and sequence b
+            starts from slot initial_state_indices[b] ...
+        has_initial_states: (batch,) ... when has_initial_states[b] is set,
+            else from zero
+        has_pad_chunks: unused trailing chunks of a static-shape launch are
+            marked by negative cu_chunk_seqlens end boundaries
     Return:
         varlen_states: (batch, nheads, headdim, dstate), or None if written
     """
@@ -234,6 +282,9 @@ def mamba_chunk_scan_combined_varlen(
         state_dtype=state_dtype,
         final_states_out=final_states_out,
         final_state_indices=final_state_indices,
+        initial_state_indices=initial_state_indices,
+        has_initial_states=has_initial_states,
+        has_pad_chunks=has_pad_chunks,
     )
     if final_states_out is not None:
         if varlen_states is not None:
