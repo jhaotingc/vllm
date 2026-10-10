@@ -8,7 +8,10 @@
 
 import torch
 
-from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.model_executor.layers.mamba.ops.triton_helpers import (
+    fast_exp,
+    launch_autotuned,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -150,33 +153,44 @@ def _state_passing_fwd(
     )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), batch, nheads)
-    with torch.accelerator.device_index(states.device.index):
-        _state_passing_fwd_kernel[grid](
-            states_ptr=states,
-            out_ptr=out,
-            dA_cs_ptr=dA_cumsum,
-            initstates_ptr=initial_states,
-            last_chunk_indices_ptr=last_chunk_indices,
-            final_states_ptr=final_states,
-            final_state_indices_ptr=final_state_indices,
-            dim=dim,
-            chunk_size=chunk_size,
-            stride_states_chunk=states.stride(0),
-            stride_states_head=states.stride(1),
-            stride_states_dim=states.stride(2),
-            stride_out_chunk=out.stride(0),
-            stride_out_head=out.stride(1),
-            stride_out_dim=out.stride(2),
-            stride_dA_cs_head=dA_cumsum.stride(0),
-            stride_dA_cs_chunk=dA_cumsum.stride(1),
-            stride_dA_cs_csize=dA_cumsum.stride(2),
-            stride_initstates_batch=initial_states_strides[0],
-            stride_initstates_head=initial_states_strides[1],
-            stride_initstates_dim=initial_states_strides[2],
-            stride_final_states_slot=final_states_strides[0],
-            stride_final_states_head=final_states_strides[1],
-            stride_final_states_dim=final_states_strides[2],
-            HAS_INITSTATES=initial_states is not None,
-            HAS_FINAL_STATES=final_states is not None,
-        )
+    launch_autotuned(
+        _state_passing_fwd_kernel,
+        grid,
+        (
+            dim,
+            states.dtype,
+            out_dtype,
+            dA_cumsum.dtype,
+            None if initial_states is None else initial_states.dtype,
+            last_chunk_indices.dtype,
+            None if final_states is None else final_states.dtype,
+            None if final_state_indices is None else final_state_indices.dtype,
+        ),
+        states_ptr=states,
+        out_ptr=out,
+        dA_cs_ptr=dA_cumsum,
+        initstates_ptr=initial_states,
+        last_chunk_indices_ptr=last_chunk_indices,
+        final_states_ptr=final_states,
+        final_state_indices_ptr=final_state_indices,
+        dim=dim,
+        chunk_size=chunk_size,
+        stride_states_chunk=states.stride(0),
+        stride_states_head=states.stride(1),
+        stride_states_dim=states.stride(2),
+        stride_out_chunk=out.stride(0),
+        stride_out_head=out.stride(1),
+        stride_out_dim=out.stride(2),
+        stride_dA_cs_head=dA_cumsum.stride(0),
+        stride_dA_cs_chunk=dA_cumsum.stride(1),
+        stride_dA_cs_csize=dA_cumsum.stride(2),
+        stride_initstates_batch=initial_states_strides[0],
+        stride_initstates_head=initial_states_strides[1],
+        stride_initstates_dim=initial_states_strides[2],
+        stride_final_states_slot=final_states_strides[0],
+        stride_final_states_head=final_states_strides[1],
+        stride_final_states_dim=final_states_strides[2],
+        HAS_INITSTATES=initial_states is not None,
+        HAS_FINAL_STATES=final_states is not None,
+    )
     return out

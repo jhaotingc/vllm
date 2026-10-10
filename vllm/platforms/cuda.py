@@ -752,7 +752,10 @@ class CudaPlatformBase(Platform):
         )
 
     @classmethod
+    @cache
     def is_arch_support_pdl(cls) -> bool:
+        # Kernel wrappers query this on every launch; the answer is fixed for
+        # the process (vLLM assumes all visible GPUs share an architecture).
         try:
             device = torch.cuda.current_device()
             major, _ = torch.cuda.get_device_capability(device)
