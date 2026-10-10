@@ -975,6 +975,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             assert state_indices_tensor_p is not None
             has_checkpoints = checkpoint_chunk_idx is not None
             if self.use_flashinfer_ssd and not has_checkpoints:
+                assert query_start_loc_p is not None
                 # The fused scan also writes each final state into its slot.
                 mamba_chunk_scan_flashinfer(
                     hidden_states_p.view(
