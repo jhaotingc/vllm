@@ -86,6 +86,7 @@ def _bmm_chunk_fwd_kernel(
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
     dot_dtype: tl.constexpr,
+    HAS_PAD_CHUNKS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -102,6 +103,10 @@ def _bmm_chunk_fwd_kernel(
 
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    # Static-shape launches end with unused chunks, marked by a negative end
+    # boundary.
+    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
+        return
 
     a_ptr += chunk_seqlen_start * stride_a_seqlen + pid_h * stride_a_head
     b_ptr += chunk_seqlen_start * stride_b_seqlen + pid_h * stride_b_head
@@ -146,7 +151,15 @@ def _bmm_chunk_fwd_kernel(
     )
 
 
-def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None):
+def _bmm_chunk_fwd(
+    a,
+    b,
+    chunk_size,
+    cu_chunk_seqlens,
+    causal=False,
+    output_dtype=None,
+    has_pad_chunks=False,
+):
     """Argument:
         a: (seqlen, ngroups, k)
         b: (seqlen, ngroups, k)
@@ -209,5 +222,6 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
         stride_outn=out.stride(-1),
         IS_CAUSAL=causal,
         dot_dtype=dot_dtype,
+        HAS_PAD_CHUNKS=has_pad_chunks,
     )
     return out

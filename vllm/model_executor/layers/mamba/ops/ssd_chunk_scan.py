@@ -161,6 +161,8 @@ def _chunk_scan_fwd_kernel(
     states_ptr,
     D_ptr,
     initstates_ptr,
+    initstates_indices_ptr,
+    has_initstates_ptr,
     cu_chunk_seqlens_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
@@ -200,6 +202,8 @@ def _chunk_scan_fwd_kernel(
     stride_init_states_hdim: tl.int64,
     stride_init_states_dstate: tl.constexpr,
     stride_D_head: tl.constexpr,
+    stride_initstates_indices,
+    stride_has_initstates,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
     HAS_D: tl.constexpr,
@@ -211,6 +215,8 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    INITSTATES_INDEXED: tl.constexpr,
+    HAS_PAD_CHUNKS: tl.constexpr,
 ):
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
@@ -220,6 +226,10 @@ def _chunk_scan_fwd_kernel(
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    # Static-shape launches end with unused chunks, marked by a negative end
+    # boundary.
+    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
+        return
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
@@ -238,10 +248,21 @@ def _chunk_scan_fwd_kernel(
         seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1
     )
 
+    # False only for a sequence start whose indexed initial state is absent.
+    prev_states_valid = seq_idx >= 0
     if HAS_INITSTATES and (seq_idx != seq_idx_prev):
+        if INITSTATES_INDEXED:
+            init_slot = tl.load(
+                initstates_indices_ptr + seq_idx * stride_initstates_indices
+            ).to(tl.int64)
+            prev_states_valid = (
+                tl.load(has_initstates_ptr + seq_idx * stride_has_initstates) != 0
+            ) & (init_slot >= 0)
+        else:
+            init_slot = seq_idx.to(tl.int64)
         prev_states_ptr = (
             initstates_ptr
-            + seq_idx * stride_init_states_batch
+            + init_slot * stride_init_states_batch
             + pid_h * stride_init_states_head
         )
         prev_states_hdim = stride_init_states_hdim
@@ -296,7 +317,9 @@ def _chunk_scan_fwd_kernel(
             )
             prev_states = tl.load(
                 prev_states_ptrs,
-                mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                mask=(offs_k_dstate[:, None] < dstate)
+                & (offs_n[None, :] < hdim)
+                & prev_states_valid,
                 other=0.0,
             )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
@@ -324,7 +347,8 @@ def _chunk_scan_fwd_kernel(
                 prev_states = tl.load(
                     prev_states_ptrs,
                     mask=(offs_k_dstate[:, None] < dstate - k)
-                    & (offs_n[None, :] < hdim),
+                    & (offs_n[None, :] < hdim)
+                    & prev_states_valid,
                     other=0.0,
                 )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
@@ -431,7 +455,13 @@ def _chunk_scan_fwd(
     D=None,
     z=None,
     initial_states=None,
+    initial_state_indices=None,
+    has_initial_states=None,
+    has_pad_chunks=False,
 ):
+    """With `initial_state_indices`, `initial_states` is the state cache and
+    sequence b starts from slot `initial_state_indices[b]` when
+    `has_initial_states[b]` is set, else from zero."""
     assert seq_idx is not None, "this implementation requires seq_idx"
 
     seqlen, nheads, headdim = x.shape
@@ -486,6 +516,8 @@ def _chunk_scan_fwd(
             states.dtype,
             None if D is None else D.dtype,
             None if initial_states is None else initial_states.dtype,
+            None if initial_state_indices is None else initial_state_indices.dtype,
+            None if has_initial_states is None else has_initial_states.dtype,
             cu_chunk_seqlens.dtype,
         ),
         cb_ptr=cb,
@@ -499,6 +531,8 @@ def _chunk_scan_fwd(
         states_ptr=states,
         D_ptr=D,
         initstates_ptr=initial_states,
+        initstates_indices_ptr=initial_state_indices,
+        has_initstates_ptr=has_initial_states,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
         chunk_size=chunk_size,
         hdim=headdim,
@@ -536,6 +570,12 @@ def _chunk_scan_fwd(
         stride_init_states_hdim=initial_states_strides[2],
         stride_init_states_dstate=initial_states_strides[3],
         stride_D_head=D.stride(0) if D is not None else 0,
+        stride_initstates_indices=(
+            initial_state_indices.stride(0) if initial_state_indices is not None else 0
+        ),
+        stride_has_initstates=(
+            has_initial_states.stride(0) if has_initial_states is not None else 0
+        ),
         IS_CAUSAL=True,
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
@@ -543,5 +583,7 @@ def _chunk_scan_fwd(
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        INITSTATES_INDEXED=initial_state_indices is not None,
+        HAS_PAD_CHUNKS=has_pad_chunks,
     )
     return

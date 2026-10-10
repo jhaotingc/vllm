@@ -35,6 +35,8 @@ def _state_passing_fwd_kernel(
     out_ptr,
     dA_cs_ptr,
     initstates_ptr,
+    initstates_indices_ptr,
+    has_initstates_ptr,
     last_chunk_indices_ptr,
     final_states_ptr,
     final_state_indices_ptr,
@@ -58,8 +60,11 @@ def _state_passing_fwd_kernel(
     stride_final_states_head: tl.int64,
     stride_final_states_dim: tl.constexpr,
     stride_final_state_indices,
+    stride_initstates_indices,
+    stride_has_initstates,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    INITSTATES_INDEXED: tl.constexpr,
     HAS_FINAL_STATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -88,13 +93,25 @@ def _state_passing_fwd_kernel(
 
     # Load initial state once — no per-chunk branching needed
     if HAS_INITSTATES:
+        if INITSTATES_INDEXED:
+            init_slot = tl.load(
+                initstates_indices_ptr + pid_b * stride_initstates_indices
+            ).to(tl.int64)
+            has_init = (
+                tl.load(has_initstates_ptr + pid_b * stride_has_initstates) != 0
+            ) & (init_slot >= 0)
+        else:
+            init_slot = pid_b.to(tl.int64)
+            has_init = pid_b >= 0
         initstates_ptrs = (
             initstates_ptr
-            + pid_b * stride_initstates_batch
+            + init_slot * stride_initstates_batch
             + pid_h * stride_initstates_head
             + offs_m * stride_initstates_dim
         )
-        states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        states = tl.load(initstates_ptrs, mask=(offs_m < dim) & has_init, other=0.0).to(
+            tl.float32
+        )
     else:
         states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
@@ -110,7 +127,8 @@ def _state_passing_fwd_kernel(
         dA_cs_ptr += stride_dA_cs_chunk
         out_ptrs += stride_out_chunk
 
-    # Write this sequence's final state straight into its cache slot.
+    # Write this sequence's final state straight into its cache slot
+    # (negative slots mark padded sequences).
     if HAS_FINAL_STATES:
         slot = tl.load(final_state_indices_ptr + pid_b * stride_final_state_indices).to(
             tl.int64
@@ -121,7 +139,77 @@ def _state_passing_fwd_kernel(
             + pid_h * stride_final_states_head
             + offs_m * stride_final_states_dim
         )
-        tl.store(final_states_ptrs, states, mask=offs_m < dim)
+        tl.store(final_states_ptrs, states, mask=(offs_m < dim) & (slot >= 0))
+
+
+@triton.jit
+def _write_final_states_kernel(
+    states_ptr,
+    last_chunk_indices_ptr,
+    final_states_ptr,
+    final_state_indices_ptr,
+    dim: tl.constexpr,
+    stride_states_chunk: tl.int64,
+    stride_states_head: tl.int64,
+    stride_states_dim: tl.constexpr,
+    stride_final_states_slot: tl.int64,
+    stride_final_states_head: tl.int64,
+    stride_final_states_dim: tl.constexpr,
+    stride_final_state_indices,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_b = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=2)
+    slot = tl.load(final_state_indices_ptr + pid_b * stride_final_state_indices).to(
+        tl.int64
+    )
+    # Negative slots mark padded sequences.
+    if slot < 0:
+        return
+    last_chunk = tl.load(last_chunk_indices_ptr + pid_b).to(tl.int64)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    states = tl.load(
+        states_ptr
+        + last_chunk * stride_states_chunk
+        + pid_h * stride_states_head
+        + offs_m * stride_states_dim,
+        mask=offs_m < dim,
+    )
+    tl.store(
+        final_states_ptr
+        + slot * stride_final_states_slot
+        + pid_h * stride_final_states_head
+        + offs_m * stride_final_states_dim,
+        states,
+        mask=offs_m < dim,
+    )
+
+
+def _write_final_states(states, last_chunk_indices, final_states, final_state_indices):
+    """final_states[final_state_indices[b]] = states[last_chunk_indices[b]],
+    skipping negative slots. states: (nchunks, nheads, dim) state-passing
+    output; final_states: (num_slots, nheads, dim) state cache."""
+    _, nheads, dim = states.shape
+    batch = last_chunk_indices.shape[0]
+    assert final_states.shape[1:] == (nheads, dim)
+    assert final_state_indices.shape == (batch,)
+    block_size = 1024
+    _write_final_states_kernel[(triton.cdiv(dim, block_size), batch, nheads)](
+        states,
+        last_chunk_indices,
+        final_states,
+        final_state_indices,
+        dim=dim,
+        stride_states_chunk=states.stride(0),
+        stride_states_head=states.stride(1),
+        stride_states_dim=states.stride(2),
+        stride_final_states_slot=final_states.stride(0),
+        stride_final_states_head=final_states.stride(1),
+        stride_final_states_dim=final_states.stride(2),
+        stride_final_state_indices=final_state_indices.stride(0),
+        BLOCK_SIZE=block_size,
+    )
 
 
 def _state_passing_fwd(
@@ -132,9 +220,14 @@ def _state_passing_fwd(
     out_dtype=None,
     final_states=None,
     final_state_indices=None,
+    initial_state_indices=None,
+    has_initial_states=None,
 ):
     """`final_states` (num_slots, nheads, dim), if given, receives each
-    sequence's final state at slot `final_state_indices[b]`."""
+    sequence's final state at slot `final_state_indices[b]` (skipped when
+    negative). With `initial_state_indices`, `initial_states` is the state
+    cache and sequence b starts from slot `initial_state_indices[b]` when
+    `has_initial_states[b]` is set, else from zero."""
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     batch = last_chunk_indices.shape[0]
@@ -167,6 +260,8 @@ def _state_passing_fwd(
             out_dtype,
             dA_cumsum.dtype,
             None if initial_states is None else initial_states.dtype,
+            None if initial_state_indices is None else initial_state_indices.dtype,
+            None if has_initial_states is None else has_initial_states.dtype,
             last_chunk_indices.dtype,
             None if final_states is None else final_states.dtype,
             None if final_state_indices is None else final_state_indices.dtype,
@@ -175,6 +270,8 @@ def _state_passing_fwd(
         out_ptr=out,
         dA_cs_ptr=dA_cumsum,
         initstates_ptr=initial_states,
+        initstates_indices_ptr=initial_state_indices,
+        has_initstates_ptr=has_initial_states,
         last_chunk_indices_ptr=last_chunk_indices,
         final_states_ptr=final_states,
         final_state_indices_ptr=final_state_indices,
@@ -198,7 +295,14 @@ def _state_passing_fwd(
         stride_final_state_indices=(
             final_state_indices.stride(0) if final_state_indices is not None else 0
         ),
+        stride_initstates_indices=(
+            initial_state_indices.stride(0) if initial_state_indices is not None else 0
+        ),
+        stride_has_initstates=(
+            has_initial_states.stride(0) if has_initial_states is not None else 0
+        ),
         HAS_INITSTATES=initial_states is not None,
+        INITSTATES_INDEXED=initial_state_indices is not None,
         HAS_FINAL_STATES=final_states is not None,
     )
     return out

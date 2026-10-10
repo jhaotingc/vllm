@@ -803,6 +803,7 @@ class EngineArgs:
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
     mamba_ssd_backend: MambaSSDBackend = MambaConfig.ssd_backend
+    mamba_mixed_batch_cudagraph: bool = MambaConfig.mixed_batch_cudagraph
     enable_mamba_cache_stochastic_rounding: bool = (
         MambaConfig.enable_stochastic_rounding
     )
@@ -1089,6 +1090,10 @@ class EngineArgs:
             "--mamba-ssu-algorithm", **mamba_kwargs["ssu_algorithm"]
         )
         mamba_group.add_argument("--mamba-ssd-backend", **mamba_kwargs["ssd_backend"])
+        mamba_group.add_argument(
+            "--mamba-mixed-batch-cudagraph",
+            **mamba_kwargs["mixed_batch_cudagraph"],
+        )
         mamba_group.add_argument(
             "--enable-mamba-cache-stochastic-rounding",
             **mamba_kwargs["enable_stochastic_rounding"],
@@ -2708,6 +2713,8 @@ class EngineArgs:
         if self.mamba_ssu_algorithm is not None:
             mamba_config.ssu_algorithm = self.mamba_ssu_algorithm
         mamba_config.ssd_backend = self.mamba_ssd_backend
+        if self.mamba_mixed_batch_cudagraph:
+            mamba_config.mixed_batch_cudagraph = True
         if self.enable_mamba_cache_stochastic_rounding:
             mamba_config.enable_stochastic_rounding = (
                 self.enable_mamba_cache_stochastic_rounding

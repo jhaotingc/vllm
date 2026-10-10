@@ -345,12 +345,19 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         common: M,
         common_attn_metadata: CommonAttentionMetadata,
         checkpoint_offsets_p: list[int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[list[int], list[int], list[int]],
+    ]:
         """Compute chunk metadata and return as device tensors.
         Returns (cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p,
-        checkpoint_chunk_idx_p). The last is None unless a row checkpoints;
-        it has one entry per prefill row, holding the logical chunk that ends
-        on the checkpoint, and 0 for rows that decline.
+        checkpoint_chunk_idx_p, host_lists). checkpoint_chunk_idx_p is None
+        unless a row checkpoints; it has one entry per prefill row, holding the
+        logical chunk that ends on the checkpoint, and 0 for rows that decline.
+        host_lists holds the first three as host lists.
         """
         num_prefills = common.num_prefills
 
@@ -388,7 +395,13 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             if any(idx >= 0 for idx in ckpt_idxs)
             else None
         )
-        return cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p, ckpt_idx_p
+        return (
+            cu_chunk_seqlen_p,
+            seq_idx_p,
+            last_chunk_indices_p,
+            ckpt_idx_p,
+            (cu_chunk_seqlen, seq_idx, last_chunk_indices),
+        )
 
     def _compute_common_metadata(
         self,
@@ -665,6 +678,25 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         elif self.use_flashinfer_replayssm:
             replayssm_state_indices_d = state_indices_tensor_d[:, 0].contiguous()
         return state_indices_tensor_d, replayssm_state_indices_d
+
+    def _stage_static_decode_indices(
+        self, metadata: M, state_indices_tensor_d: torch.Tensor, num_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Stage this group's decode state indices into the persistent decode
+        buffers padded to `num_rows` rows with NULL_BLOCK_ID, for a mixer
+        captured in a piecewise CUDA graph. Returns the (num_rows, ...) views
+        of the state indices and of their first column for FlashInfer
+        ReplaySSM."""
+        num_decodes = metadata.num_decodes
+        state_indices = self.state_indices_tensor_d[:num_rows]
+        state_indices[:num_decodes].copy_(state_indices_tensor_d, non_blocking=True)
+        state_indices[num_decodes:] = NULL_BLOCK_ID
+        replayssm_state_indices = None
+        if self.use_flashinfer_replayssm:
+            assert self.decode_replayssm_state_indices_d is not None
+            replayssm_state_indices = self.decode_replayssm_state_indices_d[:num_rows]
+            replayssm_state_indices.copy_(state_indices[:, 0], non_blocking=True)
+        return state_indices, replayssm_state_indices
 
     def _update_metadata_for_cudagraph_capture(
         self,
