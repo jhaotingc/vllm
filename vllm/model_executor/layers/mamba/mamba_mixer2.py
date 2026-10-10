@@ -286,6 +286,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
     # --8<-- [end:mamba_mixer2]
 
+    # (dim, width) view of conv1d's weight, registered as a buffer in __init__.
+    conv_weights: torch.Tensor
+
     def __init__(
         self,
         hidden_size: int,
@@ -1285,6 +1288,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         num_tokens = hidden_states_B_C.shape[0]
         assert num_tokens == static.num_tokens
         assert self.replayssm_buffer_len is not None and x_cache is not None
+        assert B_cache is not None and dt_cache is not None
         assert ring_start is not None and prev_num_accepted is not None
         assert prev_query_len is not None
         assert static.replayssm_state_indices_d is not None

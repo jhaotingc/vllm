@@ -417,8 +417,11 @@ class Mamba2AttentionMetadataBuilder(
             num_accepted_tokens[num_decodes:] = 1
         replayssm_scratch = None
         if self.decode_replayssm_scratch is not None:
-            replayssm_scratch = tuple(  # type: ignore[assignment]
-                t[:num_decode_rows] for t in self.decode_replayssm_scratch
+            cb_scaled, cumAdt_vec, cb_old = self.decode_replayssm_scratch
+            replayssm_scratch = (
+                cb_scaled[:num_decode_rows],
+                cumAdt_vec[:num_decode_rows],
+                cb_old[:num_decode_rows],
             )
         batch_ptr_view = view("batch_ptr", num_conv_programs)
         chunk_offsets_view = view("token_chunk_offset_ptr", num_conv_programs)
