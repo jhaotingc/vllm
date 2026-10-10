@@ -705,6 +705,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         """Update the metadata for cudagraph capture.
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
+        assert metadata.state_indices_tensor_d is not None
         state_indices_tensor_d, replayssm_state_indices_d = self._stage_state_indices(
             metadata, metadata.state_indices_tensor_d
         )
