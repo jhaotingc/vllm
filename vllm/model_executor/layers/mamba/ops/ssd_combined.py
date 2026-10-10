@@ -44,6 +44,8 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
+    final_states_out=None,
+    final_state_indices=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -117,6 +119,10 @@ def _mamba_chunk_scan_combined_fwd(
         if initial_states is not None
         else None,  # (batch, nheads, headdim*dstate)
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
+        final_states=final_states_out.flatten(-2)
+        if final_states_out is not None
+        else None,  # (num_slots, nheads, headdim*dstate)
+        final_state_indices=final_state_indices,
     )
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
 
@@ -150,6 +156,8 @@ def _mamba_chunk_scan_combined_fwd(
 
     if return_intermediate_states:
         return states
+    elif final_states_out is not None:
+        return None
     else:
         return states[last_chunk_indices]
 
@@ -174,6 +182,8 @@ def mamba_chunk_scan_combined_varlen(
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
     state_dtype=None,
+    final_states_out=None,
+    final_state_indices=None,
 ):
     """Argument:
         x: (seqlen, nheads, headdim)
@@ -194,11 +204,14 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus: Whether to apply softplus to dt
         out: (seqlen, nheads, headdim) preallocated output tensor
         state_dtype: The data type of the ssm state
+        final_states_out: (num_slots, nheads, headdim, dstate) state cache
+        final_state_indices: (batch,) slot receiving each final state
     Return:
-        varlen_states: (batch, nheads, headdim, dstate)
+        varlen_states: (batch, nheads, headdim, dstate), or None if written
     """
     assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
     assert seq_idx is not None
+    assert final_states_out is None or not return_intermediate_states
 
     varlen_states = _mamba_chunk_scan_combined_fwd(
         x,
@@ -220,7 +233,14 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,
+        final_states_out=final_states_out,
+        final_state_indices=final_state_indices,
     )
+    if final_states_out is not None:
+        if varlen_states is not None:
+            # Implementations without the fused write (CPU) return the states.
+            final_states_out[final_state_indices] = varlen_states
+        return None
 
     return varlen_states
 
