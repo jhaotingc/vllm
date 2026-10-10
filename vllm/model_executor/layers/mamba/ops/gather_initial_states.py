@@ -7,7 +7,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+# Callers pass a block-table column whose alignment varies from step to step.
+@triton.jit(do_not_specialize_on_alignment=["indices_ptr"])
 def _gather_initial_states_kernel(
     state_ptr,
     indices_ptr,
