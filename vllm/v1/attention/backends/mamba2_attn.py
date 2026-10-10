@@ -140,6 +140,13 @@ class Mamba2AttentionMetadataBuilder(
         self.checkpoint_builder = MambaPrefillCheckpointBuilder(
             vllm_config, kv_cache_spec
         )
+        if self.use_spec_decode:
+            # Under spec decode, update_block_table() keeps the source group's
+            # batch-level decode buffers (like GDN), so only MRV2, which also
+            # reuses metadata at capture, may share metadata across groups.
+            self.supports_update_block_table = (
+                vllm_config.use_v2_model_runner and device.type == "cuda"
+            )
 
     def build(
         self,

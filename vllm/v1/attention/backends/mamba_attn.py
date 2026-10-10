@@ -631,6 +631,41 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
 
         return self._update_metadata_for_cudagraph_capture(metadata)
 
+    def _uses_decode_cudagraph_buffers(self, metadata: M) -> bool:
+        """Decode-only batches may replay a FULL graph, which reads the
+        persistent decode buffers captured at graph-capture time."""
+        return (
+            metadata.num_prefills == 0
+            and metadata.num_decodes <= self.decode_cudagraph_max_bs
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        )
+
+    def _stage_state_indices(
+        self, metadata: M, state_indices_tensor_d: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return this group's decode state indices and their contiguous first
+        column for FlashInfer ReplaySSM, staged into the persistent buffers
+        when the batch may replay a FULL decode graph."""
+        replayssm_state_indices_d = None
+        if self._uses_decode_cudagraph_buffers(metadata):
+            padded_bs = metadata.num_reqs
+            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
+                state_indices_tensor_d, non_blocking=True
+            )
+            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
+            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+            if self.use_flashinfer_replayssm:
+                assert self.decode_replayssm_state_indices_d is not None
+                self.decode_replayssm_state_indices_d[:padded_bs].copy_(
+                    state_indices_tensor_d[:, 0], non_blocking=True
+                )
+                replayssm_state_indices_d = self.decode_replayssm_state_indices_d[
+                    :padded_bs
+                ]
+        elif self.use_flashinfer_replayssm:
+            replayssm_state_indices_d = state_indices_tensor_d[:, 0].contiguous()
+        return state_indices_tensor_d, replayssm_state_indices_d
+
     def _update_metadata_for_cudagraph_capture(
         self,
         metadata: M,
@@ -638,26 +673,17 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         """Update the metadata for cudagraph capture.
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
-        state_indices_tensor_d = metadata.state_indices_tensor_d
+        state_indices_tensor_d, replayssm_state_indices_d = self._stage_state_indices(
+            metadata, metadata.state_indices_tensor_d
+        )
         query_start_loc_d = metadata.query_start_loc_d
         num_accepted_tokens = metadata.num_accepted_tokens
         write_pos_d = metadata.write_pos_d
         is_flush_d = metadata.is_flush_d
         bc_pre_scratch = metadata.bc_pre_scratch
         replayssm_scratch = metadata.replayssm_scratch
-        replayssm_state_indices_d = None
-        if (
-            metadata.num_prefills == 0
-            and metadata.num_decodes <= self.decode_cudagraph_max_bs
-            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        ):
+        if self._uses_decode_cudagraph_buffers(metadata):
             padded_bs = metadata.num_reqs
-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
-                state_indices_tensor_d, non_blocking=True
-            )
-            state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
-            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
-
             if self.use_spec_decode and num_accepted_tokens is not None:
                 assert query_start_loc_d is not None
                 query_start_loc_d = query_start_loc_d[: padded_bs + 1]
@@ -696,20 +722,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     cumAdt_vec[:padded_bs],
                     cb_old[:padded_bs],
                 )
-                assert self.decode_replayssm_state_indices_d is not None
-                self.decode_replayssm_state_indices_d[:padded_bs].copy_(
-                    state_indices_tensor_d[:, 0], non_blocking=True
-                )
-                replayssm_state_indices_d = self.decode_replayssm_state_indices_d[
-                    :padded_bs
-                ]
-
-        if (
-            self.use_flashinfer_replayssm
-            and state_indices_tensor_d is not None
-            and replayssm_state_indices_d is None
-        ):
-            replayssm_state_indices_d = state_indices_tensor_d[:, 0].contiguous()
 
         return replace(
             metadata,
@@ -754,6 +766,21 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         )
         state_indices_tensor_d = state_indices_tensor_d[:, : 1 + self.num_spec_tokens]
         state_indices_tensor_p = state_indices_tensor_p[:, 0]
+
+        if self.use_spec_decode:
+            # Only MRV2 shares metadata under spec decode (see the Mamba2
+            # builder). It also shares it at graph capture, so the batch-level
+            # decode buffers (num_accepted_tokens, ReplaySSM scratch) stay the
+            # source group's; re-stage only this group's state indices.
+            state_indices_tensor_d, replayssm_state_indices_d = (
+                self._stage_state_indices(metadata, state_indices_tensor_d)
+            )
+            return replace(
+                metadata,
+                state_indices_tensor_d=state_indices_tensor_d,
+                state_indices_tensor_p=state_indices_tensor_p,
+                replayssm_state_indices_d=replayssm_state_indices_d,
+            )
 
         new_metadata = replace(
             metadata,
