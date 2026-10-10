@@ -549,6 +549,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._replayssm_prev_query_len = torch.empty(0, dtype=torch.int32)
         self._commits_replayssm_trackers = True
         self._updates_replayssm_trackers = True
+        # FlashInfer ReplaySSM stochastic-rounding seed: this layer's slot in a
+        # per-step buffer shared by all such layers, which the first of them
+        # refreshes (see share_replayssm_ring_trackers).
+        self._replayssm_rand_seed: torch.Tensor | None = None
+        self._replayssm_rand_seeds: torch.Tensor | None = None
 
         self.num_spec = vllm_config.num_speculative_tokens
 
@@ -1014,6 +1019,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                             )
                             fi_cu_seqlens = None
                             fi_max_seqlen = None
+                    if self._replayssm_rand_seeds is not None:
+                        # One launch per step seeds every layer's slot.
+                        self._replayssm_rand_seeds.random_(0, 2**32)
                     selective_state_update_replayssm_flashinfer(
                         ssm_state,
                         hidden_states_d,
@@ -1043,6 +1051,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         stochastic_rounding_philox_rounds=(
                             self.mamba_config.stochastic_rounding_philox_rounds
                         ),
+                        rand_seed=self._replayssm_rand_seed,
                         cu_seqlens=fi_cu_seqlens,
                         max_seqlen=fi_max_seqlen,
                         enable_pdl=False,
@@ -1212,6 +1221,28 @@ def share_replayssm_ring_trackers(
 
         replayssm_mixers[first_layer_name]._commits_replayssm_trackers = True
         replayssm_mixers[last_layer_name]._updates_replayssm_trackers = True
+
+    # Stochastic rounding needs a fresh seed per layer and step. Give each
+    # layer a slot of one buffer, refreshed by a single launch in the first
+    # layer, instead of a torch.randint launch per layer.
+    seeded_layer_names = [
+        layer_name
+        for layer_name in ordered_layer_names
+        if layer_name in replayssm_mixers
+        and replayssm_mixers[layer_name].mamba_config.enable_stochastic_rounding
+    ]
+    if seeded_layer_names:
+        first_mixer = replayssm_mixers[seeded_layer_names[0]]
+        rand_seeds = torch.zeros(
+            len(seeded_layer_names),
+            dtype=torch.int64,
+            device=first_mixer.kv_cache[1].device,
+        )
+        for slot, layer_name in enumerate(seeded_layer_names):
+            mixer = replayssm_mixers[layer_name]
+            mixer._replayssm_rand_seed = rand_seeds[slot : slot + 1]
+            mixer._replayssm_rand_seeds = None
+        first_mixer._replayssm_rand_seeds = rand_seeds
 
 
 def mamba_mixer2(
