@@ -26,7 +26,9 @@ from vllm.triton_utils import tl, triton
     ],
     key=["dim"],
 )
-@triton.jit
+# final_state_indices_ptr is the block table's first column from the first
+# prefill row on, so its alignment changes with the number of decode rows.
+@triton.jit(do_not_specialize_on_alignment=["final_state_indices_ptr"])
 def _state_passing_fwd_kernel(
     # Pointers to matrices
     states_ptr,

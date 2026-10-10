@@ -13,7 +13,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
-@triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
+# cache_indices_ptr is the block table's first column from the first prefill
+# row on, so its alignment changes with the number of decode rows in the step.
+@triton.jit(do_not_specialize_on_alignment=["num_cache_lines", "cache_indices_ptr"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -759,7 +761,11 @@ def causal_conv1d_fn(
     return out.to(original_x_dtype)
 
 
-@triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
+# batch (the decode row count) changes every step.
+@triton.jit(
+    do_not_specialize=["batch"],
+    do_not_specialize_on_alignment=["num_cache_lines"],
+)
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
