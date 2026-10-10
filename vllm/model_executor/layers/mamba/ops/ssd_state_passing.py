@@ -55,6 +55,7 @@ def _state_passing_fwd_kernel(
     stride_final_states_slot: tl.int64,
     stride_final_states_head: tl.int64,
     stride_final_states_dim: tl.constexpr,
+    stride_final_state_indices,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_FINAL_STATES: tl.constexpr,
@@ -109,7 +110,9 @@ def _state_passing_fwd_kernel(
 
     # Write this sequence's final state straight into its cache slot.
     if HAS_FINAL_STATES:
-        slot = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
+        slot = tl.load(final_state_indices_ptr + pid_b * stride_final_state_indices).to(
+            tl.int64
+        )
         final_states_ptrs = (
             final_states_ptr
             + slot * stride_final_states_slot
@@ -190,6 +193,9 @@ def _state_passing_fwd(
         stride_final_states_slot=final_states_strides[0],
         stride_final_states_head=final_states_strides[1],
         stride_final_states_dim=final_states_strides[2],
+        stride_final_state_indices=(
+            final_state_indices.stride(0) if final_state_indices is not None else 0
+        ),
         HAS_INITSTATES=initial_states is not None,
         HAS_FINAL_STATES=final_states is not None,
     )
