@@ -38,11 +38,11 @@ _STATIC_SSD_LOOP_SEQS = 16
 # saved programs once a step has hundreds of real chunks; larger launches keep
 # one program per static chunk, the unused ones exiting at once.
 _STATIC_SSD_CHUNK_LOOP_MAX_TOKENS = 8192
-# With --mamba-ssd-backend flashinfer, static launches of at least this many
-# padded tokens run FlashInfer's scan over the whole batch: its per-token cost
-# is about half the Triton scan's, which outweighs scanning the decode and
-# padding tokens too once prefill bursts fill the step.
-STATIC_SSD_FLASHINFER_MIN_TOKENS = 16384
+# With --mamba-ssd-backend flashinfer, static launches run FlashInfer's scan
+# with one sequence slot per this many padded tokens, and at least
+# _STATIC_FLASHINFER_MIN_SEQS slots (see mamba2_static_flashinfer_seqs).
+_STATIC_FLASHINFER_TOKENS_PER_SEQ = 512
+_STATIC_FLASHINFER_MIN_SEQS = 8
 
 
 def compute_varlen_chunk_metadata(
@@ -142,6 +142,23 @@ def mamba2_static_sizes(
     return num_seqs, num_chunks, num_conv_programs, num_decode_rows
 
 
+def mamba2_static_flashinfer_seqs(num_tokens: int, max_num_seqs: int) -> int:
+    """Prefill sequence slots of FlashInfer's static scan for `num_tokens`
+    padded tokens. Its kernel runs one work item per (slot, head), empty
+    slots included, so the slots follow the step size: enough for prompts
+    of about _STATIC_FLASHINFER_TOKENS_PER_SEQ tokens. Steps with more
+    prefills run eagerly (the model runner checks this bound on the
+    unpadded token count, which can only lower it)."""
+    return min(
+        max_num_seqs,
+        num_tokens,
+        max(
+            _STATIC_FLASHINFER_MIN_SEQS,
+            cdiv(num_tokens, _STATIC_FLASHINFER_TOKENS_PER_SEQ),
+        ),
+    )
+
+
 def mamba2_static_ssd_grids(
     num_tokens: int, num_seqs: int, num_chunks: int, chunk_size: int
 ) -> tuple[int | None, int]:
@@ -184,9 +201,13 @@ class Mamba2StaticMetadata:
     # and the launch widths of the SSD kernels that stride over them.
     num_seqs_p: torch.Tensor  # (1,) int32
     num_chunks_p: torch.Tensor  # (1,) int32
-    # FlashInfer scan of the whole batch (large launches): sequence offsets
-    # [0, query_start_loc_p..., num_tokens], see mamba_chunk_scan_flashinfer_static.
-    cu_seqlens_fi: torch.Tensor | None  # (num_seqs + 3,) int32
+    # FlashInfer scan of the whole batch (--mamba-ssd-backend flashinfer),
+    # see mamba_chunk_scan_flashinfer_static: sequence offsets
+    # [0, starts of prefills 2..n, num_tokens, ...] over R slots, and the
+    # prefill tokens [start, end).
+    cu_seqlens_fi: torch.Tensor | None  # (R + 1,) int32
+    prefill_bounds_fi: torch.Tensor | None  # (2,) int32
+    num_seqs_fi: torch.Tensor | None  # (1,) int32, the prefills it scans
     seq_grid: int
     chunk_grid: int | None  # None: one program per static chunk
     # causal_conv1d_fn launch metadata (it reads these attribute names).
@@ -263,12 +284,11 @@ class Mamba2AttentionMetadataBuilder(
                 )
             )
             # Host-computed metadata goes up in one copy per step.
-            # fi_cu_head / fi_cu_tail frame query_start_loc_p into the
-            # sequence offsets of the FlashInfer scan (cu_seqlens_fi).
             segment_sizes = {
-                "fi_cu_head": 1,
                 "query_start_loc_p": num_seqs + 1,
-                "fi_cu_tail": 1,
+                "cu_seqlens_fi": num_seqs + 1,
+                "prefill_bounds_fi": 2,
+                "num_seqs_fi": 1,
                 "has_initial_states_p": num_seqs,
                 "cu_chunk_seqlens_p": num_chunks + 1,
                 "seq_idx_p": num_chunks,
@@ -289,7 +309,6 @@ class Mamba2AttentionMetadataBuilder(
             self._static_state_indices_p = torch.empty(
                 num_seqs, dtype=torch.int32, device=device
             )
-            self._static_max_seqs = num_seqs
             self._static_flashinfer_ssd = (
                 vllm_config.mamba_config.ssd_backend == "flashinfer"
             )
@@ -392,10 +411,12 @@ class Mamba2AttentionMetadataBuilder(
         chunk_grid, seq_grid = mamba2_static_ssd_grids(
             num_tokens, num_seqs, num_chunks, self.chunk_size
         )
-        use_flashinfer = (
-            self._static_flashinfer_ssd
-            and num_tokens >= STATIC_SSD_FLASHINFER_MIN_TOKENS
-            and num_seqs == self._static_max_seqs
+        num_fi_seqs = (
+            mamba2_static_flashinfer_seqs(
+                num_tokens, self.vllm_config.scheduler_config.max_num_seqs
+            )
+            if self._static_flashinfer_ssd
+            else 0
         )
         num_decodes = metadata.num_decodes
         num_prefills = metadata.num_prefills
@@ -415,8 +436,22 @@ class Mamba2AttentionMetadataBuilder(
             num_decodes : num_decodes + num_prefills + 1
         ]
         qsl_p[num_prefills + 1 :] = num_actual_tokens
-        segment("fi_cu_head", 1)[0] = 0
-        segment("fi_cu_tail", 1)[0] = num_tokens
+        if num_fi_seqs:
+            # One FlashInfer sequence per prefill: the first also covers the
+            # decode rows, the last the padding (identity rows of the scan).
+            # The model runner runs steps with more prefills than the slots
+            # eagerly, so only metadata that is never replayed (capture dummy
+            # batches, profile and eager steps) folds the surplus prefills
+            # into the last slot.
+            num_fi_prefills = min(num_prefills, num_fi_seqs)
+            cu_fi = segment("cu_seqlens_fi", num_fi_seqs + 1)
+            cu_fi[0] = 0
+            cu_fi[1:num_fi_prefills] = qsl_p[1:num_fi_prefills]
+            cu_fi[max(num_fi_prefills, 1) :] = num_tokens
+            bounds = segment("prefill_bounds_fi", 2)
+            bounds[0] = qsl_p[0]
+            bounds[1] = num_actual_tokens
+            segment("num_seqs_fi", 1)[0] = num_fi_prefills
         has_initial_states = segment("has_initial_states_p", num_seqs)
         has_initial_states[:] = 0
         if num_prefills > 0:
@@ -498,7 +533,11 @@ class Mamba2AttentionMetadataBuilder(
             last_chunk_indices_p=view("last_chunk_indices_p", num_seqs),
             num_seqs_p=view("num_seqs_p", 1),
             num_chunks_p=view("num_chunks_p", 1),
-            cu_seqlens_fi=view("fi_cu_head", num_seqs + 3) if use_flashinfer else None,
+            cu_seqlens_fi=(
+                view("cu_seqlens_fi", num_fi_seqs + 1) if num_fi_seqs else None
+            ),
+            prefill_bounds_fi=view("prefill_bounds_fi", 2) if num_fi_seqs else None,
+            num_seqs_fi=view("num_seqs_fi", 1) if num_fi_seqs else None,
             seq_grid=seq_grid,
             chunk_grid=chunk_grid,
             nums_dict={

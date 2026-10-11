@@ -54,7 +54,7 @@ from vllm.model_executor.layers.mamba.ops.ssd_flashinfer import (
     FLASHINFER_SSD_STATE_SIZE,
     mamba_chunk_scan_flashinfer,
     mamba_chunk_scan_flashinfer_static,
-    static_ssd_initial_states,
+    prepare_static_ssd,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     commit_replayssm_ring_trackers,
@@ -79,9 +79,9 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import (
-    STATIC_SSD_FLASHINFER_MIN_TOKENS,
     Mamba2AttentionMetadata,
     Mamba2StaticMetadata,
+    mamba2_static_flashinfer_seqs,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec, MambaSpec
@@ -557,19 +557,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self.mamba_config = vllm_config.mamba_config
         self.use_flashinfer_ssd = self.mamba_config.ssd_backend == "flashinfer"
-        # Capture sizes whose static launches run FlashInfer's scan; the SSD
-        # warmup prepares that path for each of them before any capture.
-        self._static_flashinfer_ssd_sizes: tuple[int, ...] = ()
-        self._static_ssd_max_seqs = vllm_config.scheduler_config.max_num_seqs
+        # Static launches (capture size -> sequence slots) that run FlashInfer's
+        # scan; the SSD warmup prepares each before any capture.
+        self._static_flashinfer_ssd_launches: dict[int, int] = {}
         if self.mamba_config.mixed_batch_cudagraph and self.use_flashinfer_ssd:
-            self._static_flashinfer_ssd_sizes = tuple(
-                sorted(
-                    size
-                    for size in vllm_config.compilation_config.cudagraph_capture_sizes
-                    or ()
-                    if size >= STATIC_SSD_FLASHINFER_MIN_TOKENS
-                )
-            )
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            self._static_flashinfer_ssd_launches = {
+                size: mamba2_static_flashinfer_seqs(size, max_num_seqs)
+                for size in vllm_config.compilation_config.cudagraph_capture_sizes or ()
+            }
         if self.use_flashinfer_ssd and (
             self.head_dim != FLASHINFER_SSD_HEAD_DIM
             or self.ssm_state_size != FLASHINFER_SSD_STATE_SIZE
@@ -848,51 +844,21 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     exc_info=True,
                 )
 
-        if self._static_flashinfer_ssd_sizes:
-            # Large captured launches run FlashInfer's scan inside CUDA graph
-            # capture: create its runner and compile its programs at each such
-            # size, and allocate its zeroed initial states and the bfloat16 D,
-            # outside any capture.
-            num_slots = self._static_ssd_max_seqs
-            static_ssd_initial_states(
-                device.index, num_slots + 2, nheads, ssm_state_dtype
-            )
-            D_bf16 = self._ssd_D()
-            max_size = self._static_flashinfer_ssd_sizes[-1]
-            x_l = torch.randn(max_size, nheads, headdim, device=device, dtype=dtype)
-            dt_l = torch.randn(max_size, nheads, device=device, dtype=dtype)
-            B_l = torch.randn(max_size, ngroups, dstate, device=device, dtype=dtype)
-            C_l = torch.randn(max_size, ngroups, dstate, device=device, dtype=dtype)
-            out_l = torch.empty_like(x_l)
-            cache = torch.zeros(
-                2, nheads, headdim, dstate, device=device, dtype=ssm_state_dtype
-            )
-            slots = torch.full((num_slots,), -1, device=device, dtype=torch.int32)
-            slots[0] = 1
-            has_initial_states = torch.zeros_like(slots)
-            num_seqs = torch.ones(1, device=device, dtype=torch.int32)
+        if self._static_flashinfer_ssd_launches:
+            # Captured launches run FlashInfer's scan inside CUDA graph capture:
+            # allocate its scratch and build each size's runner workspace (and
+            # the bfloat16 D) outside any capture.
             try:
-                for size in self._static_flashinfer_ssd_sizes:
-                    # One prefill sequence in the middle of the batch.
-                    cu_seqlens = torch.full(
-                        (num_slots + 3,), size // 2, device=device, dtype=torch.int32
-                    )
-                    cu_seqlens[0], cu_seqlens[1], cu_seqlens[-1] = 0, size // 4, size
-                    mamba_chunk_scan_flashinfer_static(
-                        x_l[:size],
-                        dt_l[:size],
-                        self.A,
-                        B_l[:size],
-                        C_l[:size],
-                        D_bf16,
-                        self.dt_bias,
-                        cu_seqlens,
-                        out_l[:size],
-                        cache,
-                        slots,
-                        has_initial_states,
-                        num_seqs,
-                    )
+                prepare_static_ssd(
+                    device,
+                    self._static_flashinfer_ssd_launches,
+                    nheads,
+                    ngroups,
+                    ssm_state_dtype,
+                    self.A,
+                    self._ssd_D(),
+                    self.dt_bias,
+                )
             except Exception:
                 logger.warning(
                     "Mamba2 static-shape FlashInfer SSD warmup failed for layer "
@@ -1388,6 +1354,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
         ).transpose(0, 1)
         hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(conv_out)
         if static.cu_seqlens_fi is not None:
+            assert static.prefill_bounds_fi is not None
+            assert static.num_seqs_fi is not None
+            num_fi_seqs = static.cu_seqlens_fi.numel() - 1
             mamba_chunk_scan_flashinfer_static(
                 hidden_states_p.view(num_tokens, nheads, self.head_dim),
                 dt,
@@ -1397,11 +1366,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 self._ssd_D(),
                 self.dt_bias,
                 static.cu_seqlens_fi,
+                static.prefill_bounds_fi,
                 out,
                 ssm_state,
-                static.state_indices_p,
-                static.has_initial_states_p,
-                static.num_seqs_p,
+                static.state_indices_p[:num_fi_seqs],
+                static.has_initial_states_p[:num_fi_seqs],
+                static.num_seqs_fi,
             )
         else:
             mamba_chunk_scan_combined_varlen(

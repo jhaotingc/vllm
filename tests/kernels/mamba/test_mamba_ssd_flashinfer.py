@@ -12,12 +12,13 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
 from vllm.model_executor.layers.mamba.ops.ssd_flashinfer import (
     FLASHINFER_SSD_HEAD_DIM,
     FLASHINFER_SSD_STATE_SIZE,
+    allocate_static_ssd_scratch,
     mamba_chunk_scan_flashinfer,
     mamba_chunk_scan_flashinfer_static,
-    static_ssd_initial_states,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.mamba2_attn import mamba2_static_flashinfer_seqs
 
 if not current_platform.is_device_capability_family(100):
     pytest.skip("FlashInfer's fused SSD needs SM100/SM103", allow_module_level=True)
@@ -148,7 +149,8 @@ def test_flashinfer_ssd_static_graph_matches_eager(
     """The static FlashInfer scan of a piecewise-captured mixer, over the whole
     padded batch [decode tokens | prefill tokens | padding] and captured in a
     CUDA graph, matches the eager FlashInfer scan of the prefill tokens on
-    every replay, also after the step's layout and inputs change."""
+    every replay, also after the step's layout and inputs change. The decode
+    and padding rows are identity rows of the first and the last sequence."""
     set_random_seed(0)
     device = torch.device("cuda")
     nheads, ngroups = 16, 4
@@ -173,11 +175,12 @@ def test_flashinfer_ssd_static_graph_matches_eager(
     )
     out = torch.empty(num_tokens, nheads, headdim, dtype=bf16, device=device)
     # Persistent metadata the graph reads.
-    cu_seqlens_fi = torch.empty(static_seqs + 3, dtype=i32, device=device)
+    cu_seqlens_fi = torch.empty(static_seqs + 1, dtype=i32, device=device)
+    prefill_bounds = torch.empty(2, dtype=i32, device=device)
     state_indices = torch.empty(static_seqs, dtype=i32, device=device)
     has_initial = torch.empty(static_seqs, dtype=i32, device=device)
     num_seqs = torch.empty(1, dtype=i32, device=device)
-    static_ssd_initial_states(device.index, static_seqs + 2, nheads, f16)
+    allocate_static_ssd_scratch(device, static_seqs, num_tokens, nheads, f16)
 
     def stage(start):
         """New inputs and a layout with the prefills from token `start`."""
@@ -194,10 +197,11 @@ def test_flashinfer_ssd_static_graph_matches_eager(
         dt_full[end:] = float("nan")
         cu_seqlens_fi.copy_(
             torch.tensor(
-                [0, *offsets, *[end] * (static_seqs - batch), num_tokens],
+                [0, *offsets[1:-1], *[num_tokens] * (static_seqs - max(batch, 1) + 1)],
                 dtype=i32,
             )
         )
+        prefill_bounds.copy_(torch.tensor([start, end], dtype=i32))
         state_indices.fill_(-1)
         state_indices[:batch] = slots
         has_initial.zero_()
@@ -240,6 +244,7 @@ def test_flashinfer_ssd_static_graph_matches_eager(
             D,
             dt_bias,
             cu_seqlens_fi,
+            prefill_bounds,
             out,
             cache,
             state_indices,
@@ -273,3 +278,16 @@ def test_flashinfer_ssd_static_graph_matches_eager(
         untouched = torch.ones(num_cache_slots, dtype=torch.bool, device=device)
         untouched[slots.long()] = False
         assert torch.equal(cache[untouched], ref_cache[untouched])
+
+
+def test_static_flashinfer_seqs_follow_the_size():
+    """The sequence slots of the static FlashInfer scan never exceed the
+    static launch's and never shrink as the size grows (the model runner
+    bounds a step's slots by those of its unpadded size)."""
+    for max_num_seqs in (8, 128, 256):
+        previous = 0
+        for num_tokens in range(1, 40000, 37):
+            slots = mamba2_static_flashinfer_seqs(num_tokens, max_num_seqs)
+            assert 1 <= slots <= min(max_num_seqs, num_tokens)
+            assert slots >= previous
+            previous = slots

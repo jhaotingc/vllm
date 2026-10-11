@@ -419,6 +419,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.num_speculative_steps
             + self.model_state.num_new_sampled_tokens_per_step
         )
+        # A piecewise-captured Mamba2 mixer scanning with FlashInfer has a
+        # bounded number of prefill sequences per padded size; steps with more
+        # prefills run eagerly (see mamba2_static_flashinfer_seqs).
+        self.mamba_static_flashinfer_max_num_seqs: int | None = None
+        mamba_config = self.vllm_config.mamba_config
+        if (
+            mamba_config.mixed_batch_cudagraph
+            and mamba_config.ssd_backend == "flashinfer"
+        ):
+            self.mamba_static_flashinfer_max_num_seqs = (
+                self.vllm_config.scheduler_config.max_num_seqs
+            )
 
         if self.parallel_config.enable_batch_sharded_sampling:
             if hasattr(self.model, "compute_logits_local"):
@@ -1255,6 +1267,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def _exceeds_mamba_static_prefills(
+        self, batch_req_state: "BatchReqState | None", num_tokens: int
+    ) -> bool:
+        """Whether the batch has more prefills than the static FlashInfer
+        scan of a piecewise-captured Mamba2 mixer holds at its size. Counts
+        every request that is prefilling or has more tokens than a decode,
+        a bound on the mixer's prefills, against the slots of the unpadded
+        size, a bound on those of the graph it would replay."""
+        if (
+            self.mamba_static_flashinfer_max_num_seqs is None
+            or batch_req_state is None
+            or not batch_req_state.has_prefill
+        ):
+            return False
+        from vllm.v1.attention.backends.mamba2_attn import (
+            mamba2_static_flashinfer_seqs,
+        )
+
+        num_prefills = np.count_nonzero(
+            batch_req_state.is_prefilling_np
+            | (batch_req_state.num_scheduled_tokens > self.decode_query_len)
+        )
+        return num_prefills > mamba2_static_flashinfer_seqs(
+            num_tokens, self.mamba_static_flashinfer_max_num_seqs
+        )
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:
@@ -1774,7 +1812,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile
+            or skip_compiled
+            or self._exceeds_mamba_static_prefills(batch_req_state, num_toks),
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(

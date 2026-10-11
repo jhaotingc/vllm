@@ -7,7 +7,7 @@ launches instead of five, with the packed-varlen ``cu_seqlens`` form (the
 kernels derive their chunk metadata on the device).
 """
 
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 
@@ -114,14 +114,65 @@ def mamba_chunk_scan_flashinfer(
 # (MambaConfig.mixed_batch_cudagraph): programs along the sequence axis of the
 # state gather / scatter, which stride over the real prefill sequences.
 _STATIC_STATE_COPY_SEQS = 16
+# The rows of the static launch outside the prefill tokens (decode tokens and
+# padding) get this dt: softplus(dt + dt_bias) is 0 in float32, so with x, B
+# and C zeroed they leave the state of their sequence unchanged and output 0.
+_IDENTITY_DT = tl.constexpr(-1.0e4)
+# Programs of the static scan's input preparation, striding over the rows.
+_STATIC_PREPARE_PROGRAMS = 1024
+
+# Per device: the initial-state rows and the dt copy of the static launch,
+# allocated by allocate_static_ssd_scratch() for the largest capture size and
+# shared by every size and layer.
+_static_ssd_scratch: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-@lru_cache(maxsize=16)
+def allocate_static_ssd_scratch(
+    device: torch.device,
+    max_seqs: int,
+    max_tokens: int,
+    nheads: int,
+    state_dtype: torch.dtype,
+) -> None:
+    """Allocate, outside CUDA graph capture, the scratch shared by the static
+    scans on `device` (the mixer's warmup does, for its largest launch)."""
+    if device.index is None:
+        device = torch.device(device.type, torch.accelerator.current_device_index())
+    scratch = _static_ssd_scratch.get(device.index)
+    if (
+        scratch is not None
+        and scratch[0].size(0) >= max_seqs
+        and scratch[1].size(0) >= max_tokens
+        and scratch[0].size(1) == nheads
+        and scratch[0].dtype == state_dtype
+    ):
+        return
+    _static_ssd_scratch[device.index] = (
+        torch.empty(
+            max_seqs,
+            nheads,
+            FLASHINFER_SSD_HEAD_DIM,
+            FLASHINFER_SSD_STATE_SIZE,
+            dtype=state_dtype,
+            device=device,
+        ),
+        torch.empty(max_tokens, nheads, dtype=torch.bfloat16, device=device),
+    )
+
+
+@cache
 def _static_ssd_runner(
-    device_index: int, nheads: int, ngroups: int, state_dtype: torch.dtype
+    device_index: int,
+    num_tokens: int,
+    nheads: int,
+    ngroups: int,
+    state_dtype: torch.dtype,
 ):
-    # The captured graphs replay on one stream, so one runner per device; the
-    # mixer's warmup creates it (and compiles its programs) before any capture.
+    # One runner per padded size. A runner keeps the workspace of its call
+    # shape (index tables, the final states) and rebuilds it only for a new
+    # shape, so the warmup builds each size's workspace outside any capture and
+    # the graphs captured at that size keep using it, with no rebuild recorded
+    # in them. The graphs replay on one stream.
     from flashinfer.mamba import SSDCombined
 
     with torch.accelerator.device_index(device_index):
@@ -142,21 +193,95 @@ def _static_ssd_runner(
         )
 
 
-@lru_cache(maxsize=4)
-def static_ssd_initial_states(
-    device_index: int, rows: int, nheads: int, state_dtype: torch.dtype
-) -> torch.Tensor:
-    """Zeroed initial states of the static launch, shared by all layers. Each
-    call writes only the rows of the real prefill sequences; the rows of the
-    decode and padding pseudo-sequences stay zero. Allocate it outside CUDA
-    graph capture (the warmup does), where the zero fill runs."""
-    return torch.zeros(
-        rows,
-        nheads,
-        FLASHINFER_SSD_HEAD_DIM,
-        FLASHINFER_SSD_STATE_SIZE,
-        dtype=state_dtype,
-        device=torch.device("cuda", device_index),
+@triton.jit
+def _prepare_static_scan_kernel(
+    x_ptr,
+    b_ptr,
+    c_ptr,
+    dt_ptr,
+    dt_out_ptr,
+    prefill_bounds_ptr,
+    stride_x,
+    stride_b,
+    stride_c,
+    stride_dt,
+    num_tokens,
+    x_size: tl.constexpr,
+    bc_size: tl.constexpr,
+    nheads: tl.constexpr,
+    X_BLOCK: tl.constexpr,
+    BC_BLOCK: tl.constexpr,
+    H_BLOCK: tl.constexpr,
+):
+    """Copy dt into the scan's dt, and make every row outside the prefill
+    tokens [prefill_bounds[0], prefill_bounds[1]) an identity row: x, B and C
+    zeroed in place and dt = _IDENTITY_DT."""
+    start = tl.load(prefill_bounds_ptr)
+    end = tl.load(prefill_bounds_ptr + 1)
+    heads = tl.arange(0, H_BLOCK)
+    x_offsets = tl.arange(0, X_BLOCK)
+    bc_offsets = tl.arange(0, BC_BLOCK)
+    x_zeros = tl.zeros([X_BLOCK], dtype=x_ptr.dtype.element_ty)
+    bc_zeros = tl.zeros([BC_BLOCK], dtype=b_ptr.dtype.element_ty)
+    for token in tl.range(
+        tl.program_id(0), num_tokens, tl.num_programs(0), num_stages=1
+    ):
+        row = token.to(tl.int64)
+        is_prefill = (token >= start) & (token < end)
+        dt = tl.load(dt_ptr + row * stride_dt + heads, mask=heads < nheads)
+        tl.store(
+            dt_out_ptr + row * nheads + heads,
+            tl.where(is_prefill, dt, _IDENTITY_DT),
+            mask=heads < nheads,
+        )
+        if not is_prefill:
+            tl.store(
+                x_ptr + row * stride_x + x_offsets, x_zeros, mask=x_offsets < x_size
+            )
+            tl.store(
+                b_ptr + row * stride_b + bc_offsets,
+                bc_zeros,
+                mask=bc_offsets < bc_size,
+            )
+            tl.store(
+                c_ptr + row * stride_c + bc_offsets,
+                bc_zeros,
+                mask=bc_offsets < bc_size,
+            )
+
+
+def _prepare_static_scan(
+    x: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    dt: torch.Tensor,
+    dt_out: torch.Tensor,
+    prefill_bounds: torch.Tensor,
+) -> None:
+    num_tokens, nheads = dt.shape
+    for t in (x, B, C):
+        assert t[0].is_contiguous()
+    assert dt.stride(1) == 1 and dt_out.is_contiguous()
+    assert B[0].numel() == C[0].numel()
+    _prepare_static_scan_kernel[(min(num_tokens, _STATIC_PREPARE_PROGRAMS),)](
+        x,
+        B,
+        C,
+        dt,
+        dt_out,
+        prefill_bounds,
+        x.stride(0),
+        B.stride(0),
+        C.stride(0),
+        dt.stride(0),
+        num_tokens,
+        x_size=x[0].numel(),
+        bc_size=B[0].numel(),
+        nheads=nheads,
+        X_BLOCK=triton.next_power_of_2(x[0].numel()),
+        BC_BLOCK=triton.next_power_of_2(B[0].numel()),
+        H_BLOCK=triton.next_power_of_2(nheads),
+        num_warps=4,
     )
 
 
@@ -172,15 +297,15 @@ def _copy_static_states_kernel(
     GATHER: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Sequence b of the static batch is row b + 1 of the launch's (R + 2)
-    state rows. GATHER: cache -> rows (zero without an initial state);
-    else rows -> cache (skipping negative slots)."""
+    """Sequence b of the static batch is row b of the launch's state rows.
+    GATHER: cache -> rows (zero without an initial state); else rows -> cache
+    (skipping negative slots)."""
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < row_size
     num_seqs = tl.load(num_seqs_ptr)
     for b in tl.range(tl.program_id(1), num_seqs, tl.num_programs(1), num_stages=1):
         slot = tl.load(indices_ptr + b).to(tl.int64)
-        row = (b + 1).to(tl.int64) * row_size + offsets
+        row = b.to(tl.int64) * row_size + offsets
         if GATHER:
             has_initial_state = (tl.load(has_initial_states_ptr + b) != 0) & (slot >= 0)
             values = tl.load(
@@ -230,76 +355,6 @@ def _copy_static_states(
     )
 
 
-# Programs of the pseudo-sequence row clearing, which stride over the decode
-# and padding rows.
-_STATIC_PSEUDO_ROW_PROGRAMS = 128
-
-
-@triton.jit
-def _clear_static_pseudo_rows_kernel(
-    x_ptr,
-    b_ptr,
-    c_ptr,
-    cu_seqlens_ptr,
-    stride_x,
-    stride_b,
-    stride_c,
-    num_tokens,
-    padding_seq,
-    x_size: tl.constexpr,
-    bc_size: tl.constexpr,
-    X_BLOCK: tl.constexpr,
-    BC_BLOCK: tl.constexpr,
-):
-    """Zero the rows of x, B and C outside the prefill sequences: those of the
-    decode pseudo-sequence [0, cu_seqlens[1]) and of the padding
-    pseudo-sequence [cu_seqlens[padding_seq], num_tokens)."""
-    num_decode_tokens = tl.load(cu_seqlens_ptr + 1)
-    padding_start = tl.load(cu_seqlens_ptr + padding_seq)
-    num_rows = num_decode_tokens + num_tokens - padding_start
-    x_offsets = tl.arange(0, X_BLOCK)
-    bc_offsets = tl.arange(0, BC_BLOCK)
-    x_zeros = tl.zeros([X_BLOCK], dtype=x_ptr.dtype.element_ty)
-    bc_zeros = tl.zeros([BC_BLOCK], dtype=b_ptr.dtype.element_ty)
-    for r in tl.range(tl.program_id(0), num_rows, tl.num_programs(0), num_stages=1):
-        row = tl.where(
-            r < num_decode_tokens, r, padding_start + r - num_decode_tokens
-        ).to(tl.int64)
-        tl.store(x_ptr + row * stride_x + x_offsets, x_zeros, mask=x_offsets < x_size)
-        tl.store(
-            b_ptr + row * stride_b + bc_offsets, bc_zeros, mask=bc_offsets < bc_size
-        )
-        tl.store(
-            c_ptr + row * stride_c + bc_offsets, bc_zeros, mask=bc_offsets < bc_size
-        )
-
-
-def _clear_static_pseudo_rows(
-    x: torch.Tensor, B: torch.Tensor, C: torch.Tensor, cu_seqlens: torch.Tensor
-) -> None:
-    num_tokens = x.size(0)
-    for t in (x, B, C):
-        assert t[0].is_contiguous()
-    assert B.stride(0) == C.stride(0) and B[0].numel() == C[0].numel()
-    grid = (min(num_tokens, _STATIC_PSEUDO_ROW_PROGRAMS),)
-    _clear_static_pseudo_rows_kernel[grid](
-        x,
-        B,
-        C,
-        cu_seqlens,
-        x.stride(0),
-        B.stride(0),
-        C.stride(0),
-        num_tokens,
-        cu_seqlens.numel() - 2,
-        x_size=x[0].numel(),
-        bc_size=B[0].numel(),
-        X_BLOCK=triton.next_power_of_2(x[0].numel()),
-        BC_BLOCK=triton.next_power_of_2(B[0].numel()),
-        num_warps=4,
-    )
-
-
 def mamba_chunk_scan_flashinfer_static(
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -309,6 +364,7 @@ def mamba_chunk_scan_flashinfer_static(
     D: torch.Tensor,
     dt_bias: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    prefill_bounds: torch.Tensor,
     out: torch.Tensor,
     ssm_state: torch.Tensor,
     state_indices: torch.Tensor,
@@ -320,42 +376,41 @@ def mamba_chunk_scan_flashinfer_static(
     shape fixed by T and no host synchronization (the kernels derive their
     segments from cu_seqlens on the device).
 
-    cu_seqlens: (R + 3,) int32, [0, prefill starts..., prefill end, T]:
-        sequence 0 covers the decode tokens, 1..R the R prefill slots (empty
-        past the real ones) and R + 1 the padding. The pseudo-sequences start
-        from zero and are written to out but never to the cache; the decode
-        sub-path overwrites the decode rows afterwards.
+    cu_seqlens: (R + 1,) int32, [0, starts of prefills 2..n, T, ..., T]: R
+        sequence slots, the n real prefills then empty ones. The decode rows
+        before the first prefill and the padding rows after the last one are
+        identity rows of the first and the last sequence (x, B, C zeroed in
+        place and dt = _IDENTITY_DT in the scan's copy of dt): they leave its
+        state unchanged and output 0. The decode sub-path overwrites the
+        decode rows of out afterwards; the padding rows are unused. Zeroing
+        those rows also keeps whatever the conv1d left in them, which it does
+        not write, out of the real sequences: FlashInfer's 128-token tiles
+        span sequence boundaries (0 * NaN).
+    prefill_bounds: (2,) int32, the prefill tokens [start, end).
     state_indices, has_initial_states: (R,) int32 of the prefill slots.
     num_seqs: (1,) int32, the real prefill sequences.
-    Other arguments as mamba_chunk_scan_flashinfer.
-
-    The rows of x, B and C outside the prefill sequences are zeroed in place
-    first. FlashInfer computes whole 128-token tiles, masking the pairs across
-    sequence boundaries, so a NaN or Inf in a pseudo-sequence's rows would
-    reach the outputs and the state of the prefill sequence sharing its tile
-    (0 * NaN); the conv1d of the mixer leaves those rows unwritten.
+    Other arguments as mamba_chunk_scan_flashinfer; the scratch must have been
+    allocated (allocate_static_ssd_scratch) and each size's runner warmed up
+    outside capture.
     """
+    num_tokens, nheads, _ = x.shape
     num_slots = state_indices.numel()
-    assert cu_seqlens.numel() == num_slots + 3
-    nheads, ngroups = x.size(1), B.size(1)
+    assert cu_seqlens.numel() == num_slots + 1
     device_index = x.device.index
-    _clear_static_pseudo_rows(x, B, C, cu_seqlens)
-    initial_states = static_ssd_initial_states(
-        device_index, num_slots + 2, nheads, ssm_state.dtype
-    )
+    initial_rows, dt_rows = _static_ssd_scratch[device_index]
+    initial_states = initial_rows[:num_slots]
+    dt_scan = dt_rows[:num_tokens]
+    assert initial_states.size(0) == num_slots and dt_scan.size(0) == num_tokens
+    _prepare_static_scan(x, B, C, dt, dt_scan, prefill_bounds)
     _copy_static_states(
         ssm_state, initial_states, state_indices, has_initial_states, num_seqs
     )
-    runner = _static_ssd_runner(device_index, nheads, ngroups, ssm_state.dtype)
-    # The runner keeps the workspace of its last call shape (index tables its
-    # device kernels fill) and rebuilds it only when the shape changes. Every
-    # captured graph must record that fill, so drop the cached workspace.
-    cake = getattr(runner, "_cake_runner", None)
-    if cake is not None and hasattr(cake, "_workspace_key"):
-        cake._workspace_key = None
+    runner = _static_ssd_runner(
+        device_index, num_tokens, nheads, B.size(1), ssm_state.dtype
+    )
     _, final_states = runner.run(
         x.unsqueeze(0),
-        dt.unsqueeze(0),
+        dt_scan.unsqueeze(0),
         A,
         B.unsqueeze(0),
         C.unsqueeze(0),
@@ -368,3 +423,93 @@ def mamba_chunk_scan_flashinfer_static(
         return_final_states=True,
     )
     _copy_static_states(ssm_state, final_states, state_indices, None, num_seqs)
+
+
+# (device index, padded size, slots, heads, groups, state dtype) of the
+# static scans prepared by prepare_static_ssd.
+_prepared_static_scans: set[tuple] = set()
+
+
+def prepare_static_ssd(
+    device: torch.device,
+    launches: dict[int, int],
+    nheads: int,
+    ngroups: int,
+    state_dtype: torch.dtype,
+    A: torch.Tensor,
+    D: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> None:
+    """Outside CUDA graph capture, prepare the static scans of `launches`
+    (padded size -> sequence slots): allocate their shared scratch, and run
+    one scan per size not prepared yet, which compiles FlashInfer's programs
+    and builds the size's runner workspace. Inputs are laid out like the
+    mixer's (x, B and C strided views of one conv1d output row)."""
+    if not launches:
+        return
+    max_size = max(launches)
+    allocate_static_ssd_scratch(
+        device, max(launches.values()), max_size, nheads, state_dtype
+    )
+    pending = [
+        size
+        for size, slots in sorted(launches.items())
+        if (device.index, size, slots, nheads, ngroups, state_dtype)
+        not in _prepared_static_scans
+    ]
+    if not pending:
+        return
+    x_size = nheads * FLASHINFER_SSD_HEAD_DIM
+    bc_size = ngroups * FLASHINFER_SSD_STATE_SIZE
+    xBC = torch.randn(
+        max_size, x_size + 2 * bc_size, device=device, dtype=torch.bfloat16
+    )
+    x = xBC[:, :x_size].view(max_size, nheads, FLASHINFER_SSD_HEAD_DIM)
+    B = xBC[:, x_size : x_size + bc_size].view(
+        max_size, ngroups, FLASHINFER_SSD_STATE_SIZE
+    )
+    C = xBC[:, x_size + bc_size :].view(max_size, ngroups, FLASHINFER_SSD_STATE_SIZE)
+    dt = torch.randn(max_size, 2 * nheads, device=device, dtype=torch.bfloat16)[
+        :, nheads:
+    ]
+    out = torch.empty(
+        max_size, nheads, FLASHINFER_SSD_HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
+    cache = torch.zeros(
+        2,
+        nheads,
+        FLASHINFER_SSD_HEAD_DIM,
+        FLASHINFER_SSD_STATE_SIZE,
+        device=device,
+        dtype=state_dtype,
+    )
+    num_seqs = torch.ones(1, device=device, dtype=torch.int32)
+    for size in pending:
+        slots = launches[size]
+        # One prefill sequence in the middle of the batch.
+        state_indices = torch.full((slots,), -1, device=device, dtype=torch.int32)
+        state_indices[0] = 1
+        cu_seqlens = torch.full((slots + 1,), size, device=device, dtype=torch.int32)
+        cu_seqlens[0] = 0
+        prefill_bounds = torch.tensor(
+            [size // 4, size // 2], device=device, dtype=torch.int32
+        )
+        mamba_chunk_scan_flashinfer_static(
+            x[:size],
+            dt[:size],
+            A,
+            B[:size],
+            C[:size],
+            D,
+            dt_bias,
+            cu_seqlens,
+            prefill_bounds,
+            out[:size],
+            cache,
+            state_indices,
+            torch.zeros_like(state_indices),
+            num_seqs,
+        )
+        _prepared_static_scans.add(
+            (device.index, size, slots, nheads, ngroups, state_dtype)
+        )
