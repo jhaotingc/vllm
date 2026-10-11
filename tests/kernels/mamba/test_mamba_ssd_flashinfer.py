@@ -140,6 +140,7 @@ def test_flashinfer_ssd_matches_triton(seqlens, with_initial_states, state_dtype
         (3, [1069], [0], 2048),
         (12, [500, 37, 300], [0, 64, 0], 1024),
         (0, [128, 128, 1], [128, 0, 1000], 512),
+        (5, [300, 200], [256, 0], 1024),
         (9, [], [], 64),
     ],
 )
@@ -195,9 +196,12 @@ def test_flashinfer_ssd_static_graph_matches_eager(
         xBC[:start] = float("nan")
         xBC[end:] = float("nan")
         dt_full[end:] = float("nan")
+        # The last sequence ends at the first 128-token boundary after the
+        # prefills; the padding after it is not scanned.
+        scan_end = min(num_tokens, -(-end // 128) * 128)
         cu_seqlens_fi.copy_(
             torch.tensor(
-                [0, *offsets[1:-1], *[num_tokens] * (static_seqs - max(batch, 1) + 1)],
+                [0, *offsets[1:-1], *[scan_end] * (static_seqs - max(batch, 1) + 1)],
                 dtype=i32,
             )
         )

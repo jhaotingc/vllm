@@ -376,16 +376,21 @@ def mamba_chunk_scan_flashinfer_static(
     shape fixed by T and no host synchronization (the kernels derive their
     segments from cu_seqlens on the device).
 
-    cu_seqlens: (R + 1,) int32, [0, starts of prefills 2..n, T, ..., T]: R
-        sequence slots, the n real prefills then empty ones. The decode rows
-        before the first prefill and the padding rows after the last one are
+    cu_seqlens: (R + 1,) int32, [0, starts of prefills 2..n, E, ..., E]: R
+        sequence slots, the n real prefills then empty ones, where E <= T is
+        the first 128-token boundary after the prefill tokens (or T). The
+        decode rows before the first prefill and the padding rows before E are
         identity rows of the first and the last sequence (x, B, C zeroed in
         place and dt = _IDENTITY_DT in the scan's copy of dt): they leave its
-        state unchanged and output 0. The decode sub-path overwrites the
-        decode rows of out afterwards; the padding rows are unused. Zeroing
-        those rows also keeps whatever the conv1d left in them, which it does
-        not write, out of the real sequences: FlashInfer's 128-token tiles
-        span sequence boundaries (0 * NaN).
+        state unchanged and output 0; the rows after E belong to no sequence
+        and are not scanned (their out rows are left unwritten). The decode
+        sub-path overwrites the decode rows of out afterwards; the padding
+        rows are unused. Zeroing the rows outside the prefill tokens also
+        keeps whatever the conv1d left in them, which it does not write, out
+        of the real sequences: FlashInfer's 128-token tiles span sequence
+        boundaries (0 * NaN). Empty slots must start on a 128-token boundary
+        (an empty sequence starting inside a chunk breaks the final state of
+        the sequence before it).
     prefill_bounds: (2,) int32, the prefill tokens [start, end).
     state_indices, has_initial_states: (R,) int32 of the prefill slots.
     num_seqs: (1,) int32, the real prefill sequences.

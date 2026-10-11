@@ -12,7 +12,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -43,6 +43,8 @@ _STATIC_SSD_CHUNK_LOOP_MAX_TOKENS = 8192
 # _STATIC_FLASHINFER_MIN_SEQS slots (see mamba2_static_flashinfer_seqs).
 _STATIC_FLASHINFER_TOKENS_PER_SEQ = 512
 _STATIC_FLASHINFER_MIN_SEQS = 8
+# FlashInfer's scan splits the token stream into chunks of this many tokens.
+_FLASHINFER_SSD_CHUNK = 128
 
 
 def compute_varlen_chunk_metadata(
@@ -438,7 +440,11 @@ class Mamba2AttentionMetadataBuilder(
         qsl_p[num_prefills + 1 :] = num_actual_tokens
         if num_fi_seqs:
             # One FlashInfer sequence per prefill: the first also covers the
-            # decode rows, the last the padding (identity rows of the scan).
+            # decode rows (identity rows of the scan); the last ends at the
+            # first 128-token boundary after the real tokens, and the padding
+            # after it belongs to no sequence, so the scan skips it. The empty
+            # slots start at that boundary: an empty sequence starting inside
+            # a chunk breaks the final state of the sequence before it.
             # The model runner runs steps with more prefills than the slots
             # eagerly, so only metadata that is never replayed (capture dummy
             # batches, profile and eager steps) folds the surplus prefills
@@ -447,7 +453,9 @@ class Mamba2AttentionMetadataBuilder(
             cu_fi = segment("cu_seqlens_fi", num_fi_seqs + 1)
             cu_fi[0] = 0
             cu_fi[1:num_fi_prefills] = qsl_p[1:num_fi_prefills]
-            cu_fi[max(num_fi_prefills, 1) :] = num_tokens
+            cu_fi[max(num_fi_prefills, 1) :] = min(
+                num_tokens, round_up(num_actual_tokens, _FLASHINFER_SSD_CHUNK)
+            )
             bounds = segment("prefill_bounds_fi", 2)
             bounds[0] = qsl_p[0]
             bounds[1] = num_actual_tokens
