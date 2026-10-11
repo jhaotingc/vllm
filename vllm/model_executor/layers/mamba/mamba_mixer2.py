@@ -53,6 +53,8 @@ from vllm.model_executor.layers.mamba.ops.ssd_flashinfer import (
     FLASHINFER_SSD_HEAD_DIM,
     FLASHINFER_SSD_STATE_SIZE,
     mamba_chunk_scan_flashinfer,
+    mamba_chunk_scan_flashinfer_static,
+    static_ssd_initial_states,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     commit_replayssm_ring_trackers,
@@ -77,6 +79,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import (
+    STATIC_SSD_FLASHINFER_MIN_TOKENS,
     Mamba2AttentionMetadata,
     Mamba2StaticMetadata,
 )
@@ -554,6 +557,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self.mamba_config = vllm_config.mamba_config
         self.use_flashinfer_ssd = self.mamba_config.ssd_backend == "flashinfer"
+        # Capture sizes whose static launches run FlashInfer's scan; the SSD
+        # warmup prepares that path for each of them before any capture.
+        self._static_flashinfer_ssd_sizes: tuple[int, ...] = ()
+        self._static_ssd_max_seqs = vllm_config.scheduler_config.max_num_seqs
+        if self.mamba_config.mixed_batch_cudagraph and self.use_flashinfer_ssd:
+            self._static_flashinfer_ssd_sizes = tuple(
+                sorted(
+                    size
+                    for size in vllm_config.compilation_config.cudagraph_capture_sizes
+                    or ()
+                    if size >= STATIC_SSD_FLASHINFER_MIN_TOKENS
+                )
+            )
         if self.use_flashinfer_ssd and (
             self.head_dim != FLASHINFER_SSD_HEAD_DIM
             or self.ssm_state_size != FLASHINFER_SSD_STATE_SIZE
@@ -828,6 +844,59 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 logger.warning(
                     "Mamba2 static-shape SSD warmup failed for layer %s; CUDA "
                     "graph capture may fail.",
+                    self.prefix,
+                    exc_info=True,
+                )
+
+        if self._static_flashinfer_ssd_sizes:
+            # Large captured launches run FlashInfer's scan inside CUDA graph
+            # capture: create its runner and compile its programs at each such
+            # size, and allocate its zeroed initial states and the bfloat16 D,
+            # outside any capture.
+            num_slots = self._static_ssd_max_seqs
+            static_ssd_initial_states(
+                device.index, num_slots + 2, nheads, ssm_state_dtype
+            )
+            D_bf16 = self._ssd_D()
+            max_size = self._static_flashinfer_ssd_sizes[-1]
+            x_l = torch.randn(max_size, nheads, headdim, device=device, dtype=dtype)
+            dt_l = torch.randn(max_size, nheads, device=device, dtype=dtype)
+            B_l = torch.randn(max_size, ngroups, dstate, device=device, dtype=dtype)
+            C_l = torch.randn(max_size, ngroups, dstate, device=device, dtype=dtype)
+            out_l = torch.empty_like(x_l)
+            cache = torch.zeros(
+                2, nheads, headdim, dstate, device=device, dtype=ssm_state_dtype
+            )
+            slots = torch.full((num_slots,), -1, device=device, dtype=torch.int32)
+            slots[0] = 1
+            has_initial_states = torch.zeros_like(slots)
+            num_seqs = torch.ones(1, device=device, dtype=torch.int32)
+            try:
+                for size in self._static_flashinfer_ssd_sizes:
+                    # One prefill sequence in the middle of the batch.
+                    cu_seqlens = torch.full(
+                        (num_slots + 3,), size // 2, device=device, dtype=torch.int32
+                    )
+                    cu_seqlens[0], cu_seqlens[1], cu_seqlens[-1] = 0, size // 4, size
+                    mamba_chunk_scan_flashinfer_static(
+                        x_l[:size],
+                        dt_l[:size],
+                        self.A,
+                        B_l[:size],
+                        C_l[:size],
+                        D_bf16,
+                        self.dt_bias,
+                        cu_seqlens,
+                        out_l[:size],
+                        cache,
+                        slots,
+                        has_initial_states,
+                        num_seqs,
+                    )
+            except Exception:
+                logger.warning(
+                    "Mamba2 static-shape FlashInfer SSD warmup failed for layer "
+                    "%s; CUDA graph capture may fail.",
                     self.prefix,
                     exc_info=True,
                 )
@@ -1318,33 +1387,50 @@ class MambaMixer2(MambaBase, PluggableLayer):
             query_start_loc=static.query_start_loc_p,
         ).transpose(0, 1)
         hidden_states_p, B_p, C_p = self.split_hidden_states_B_C_fn(conv_out)
-        mamba_chunk_scan_combined_varlen(
-            hidden_states_p.view(num_tokens, nheads, self.head_dim),
-            dt,
-            self.A,
-            B_p.view(num_tokens, ngroups, -1),
-            C_p.view(num_tokens, ngroups, -1),
-            chunk_size=chunk_size,
-            cu_seqlens=static.query_start_loc_p,
-            cu_chunk_seqlens=static.cu_chunk_seqlens_p,
-            last_chunk_indices=static.last_chunk_indices_p,
-            seq_idx=static.seq_idx_p,
-            out=out,
-            D=self.D,
-            dt_bias=self.dt_bias,
-            initial_states=ssm_state,
-            initial_state_indices=static.state_indices_p,
-            has_initial_states=static.has_initial_states_p,
-            dt_softplus=True,
-            state_dtype=ssm_state.dtype,
-            final_states_out=ssm_state,
-            final_state_indices=static.state_indices_p,
-            num_chunks=None if static.chunk_grid is None else static.num_chunks_p,
-            chunk_grid=static.chunk_grid,
-            has_pad_chunks=static.chunk_grid is None,
-            num_seqs=static.num_seqs_p,
-            seq_grid=static.seq_grid,
-        )
+        if static.cu_seqlens_fi is not None:
+            mamba_chunk_scan_flashinfer_static(
+                hidden_states_p.view(num_tokens, nheads, self.head_dim),
+                dt,
+                self.A,
+                B_p.view(num_tokens, ngroups, -1),
+                C_p.view(num_tokens, ngroups, -1),
+                self._ssd_D(),
+                self.dt_bias,
+                static.cu_seqlens_fi,
+                out,
+                ssm_state,
+                static.state_indices_p,
+                static.has_initial_states_p,
+                static.num_seqs_p,
+            )
+        else:
+            mamba_chunk_scan_combined_varlen(
+                hidden_states_p.view(num_tokens, nheads, self.head_dim),
+                dt,
+                self.A,
+                B_p.view(num_tokens, ngroups, -1),
+                C_p.view(num_tokens, ngroups, -1),
+                chunk_size=chunk_size,
+                cu_seqlens=static.query_start_loc_p,
+                cu_chunk_seqlens=static.cu_chunk_seqlens_p,
+                last_chunk_indices=static.last_chunk_indices_p,
+                seq_idx=static.seq_idx_p,
+                out=out,
+                D=self.D,
+                dt_bias=self.dt_bias,
+                initial_states=ssm_state,
+                initial_state_indices=static.state_indices_p,
+                has_initial_states=static.has_initial_states_p,
+                dt_softplus=True,
+                state_dtype=ssm_state.dtype,
+                final_states_out=ssm_state,
+                final_state_indices=static.state_indices_p,
+                num_chunks=None if static.chunk_grid is None else static.num_chunks_p,
+                chunk_grid=static.chunk_grid,
+                has_pad_chunks=static.chunk_grid is None,
+                num_seqs=static.num_seqs_p,
+                seq_grid=static.seq_grid,
+            )
         if self._updates_replayssm_trackers:
             reset_replayssm_ring_trackers(
                 ring_start, prev_num_accepted, prev_query_len, static.state_indices_p

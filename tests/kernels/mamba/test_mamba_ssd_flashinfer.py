@@ -13,6 +13,8 @@ from vllm.model_executor.layers.mamba.ops.ssd_flashinfer import (
     FLASHINFER_SSD_HEAD_DIM,
     FLASHINFER_SSD_STATE_SIZE,
     mamba_chunk_scan_flashinfer,
+    mamba_chunk_scan_flashinfer_static,
+    static_ssd_initial_states,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -129,3 +131,145 @@ def test_flashinfer_ssd_matches_triton(seqlens, with_initial_states, state_dtype
     untouched = torch.ones(num_slots, dtype=torch.bool, device=device)
     untouched[slots.long()] = False
     assert torch.equal(cache[untouched], ref_cache[untouched])
+
+
+@pytest.mark.parametrize(
+    "num_decode_tokens,seqlens,computed,num_tokens",
+    [
+        (3, [1069], [0], 2048),
+        (12, [500, 37, 300], [0, 64, 0], 1024),
+        (0, [128, 128, 1], [128, 0, 1000], 512),
+        (9, [], [], 64),
+    ],
+)
+def test_flashinfer_ssd_static_graph_matches_eager(
+    num_decode_tokens, seqlens, computed, num_tokens
+):
+    """The static FlashInfer scan of a piecewise-captured mixer, over the whole
+    padded batch [decode tokens | prefill tokens | padding] and captured in a
+    CUDA graph, matches the eager FlashInfer scan of the prefill tokens on
+    every replay, also after the step's layout and inputs change."""
+    set_random_seed(0)
+    device = torch.device("cuda")
+    nheads, ngroups = 16, 4
+    headdim, dstate = FLASHINFER_SSD_HEAD_DIM, FLASHINFER_SSD_STATE_SIZE
+    bf16, f16, i32 = torch.bfloat16, torch.float16, torch.int32
+    static_seqs = 6
+    num_cache_slots = 2 * static_seqs + 3
+    batch = len(seqlens)
+    conv_dim = nheads * headdim + 2 * ngroups * dstate
+
+    xBC = torch.empty(num_tokens, conv_dim, dtype=bf16, device=device)
+    x = xBC[:, : nheads * headdim].view(num_tokens, nheads, headdim)
+    B = xBC[:, nheads * headdim : -ngroups * dstate].view(num_tokens, ngroups, dstate)
+    C = xBC[:, -ngroups * dstate :].view(num_tokens, ngroups, dstate)
+    dt_full = torch.empty(num_tokens, 2 * nheads, dtype=bf16, device=device)
+    dt = dt_full[:, nheads:]
+    A = -torch.rand(nheads, dtype=torch.float32, device=device) * 2
+    D = torch.rand(nheads, dtype=torch.float32, device=device).to(bf16)
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device=device) - 2
+    cache = torch.empty(
+        num_cache_slots, nheads, headdim, dstate, dtype=f16, device=device
+    )
+    out = torch.empty(num_tokens, nheads, headdim, dtype=bf16, device=device)
+    # Persistent metadata the graph reads.
+    cu_seqlens_fi = torch.empty(static_seqs + 3, dtype=i32, device=device)
+    state_indices = torch.empty(static_seqs, dtype=i32, device=device)
+    has_initial = torch.empty(static_seqs, dtype=i32, device=device)
+    num_seqs = torch.empty(1, dtype=i32, device=device)
+    static_ssd_initial_states(device.index, static_seqs + 2, nheads, f16)
+
+    def stage(start):
+        """New inputs and a layout with the prefills from token `start`."""
+        xBC.copy_(torch.randn_like(xBC) * 0.5)
+        dt_full.copy_(torch.randn_like(dt_full))
+        cache.copy_(torch.randn_like(cache) * 0.1)
+        slots = torch.randperm(num_cache_slots, device=device)[:batch].to(i32)
+        offsets = [start, *(start + torch.tensor(seqlens).cumsum(0)).tolist()]
+        end = offsets[-1]
+        # The mixer's conv1d leaves the rows outside the prefill sequences
+        # unwritten, so they can hold any bits, NaN included.
+        xBC[:start] = float("nan")
+        xBC[end:] = float("nan")
+        dt_full[end:] = float("nan")
+        cu_seqlens_fi.copy_(
+            torch.tensor(
+                [0, *offsets, *[end] * (static_seqs - batch), num_tokens],
+                dtype=i32,
+            )
+        )
+        state_indices.fill_(-1)
+        state_indices[:batch] = slots
+        has_initial.zero_()
+        has_initial[:batch] = torch.tensor([c > 0 for c in computed], dtype=i32)
+        num_seqs.fill_(batch)
+        return slots, offsets
+
+    def reference(slots, offsets):
+        ref_cache = cache.clone()
+        ref_out = None
+        if batch:
+            start, end = offsets[0], offsets[-1]
+            ref_out = torch.empty(
+                end - start, nheads, headdim, dtype=bf16, device=device
+            )
+            has = has_initial[:batch].bool()
+            mamba_chunk_scan_flashinfer(
+                x[start:end],
+                dt[start:end],
+                A,
+                B[start:end],
+                C[start:end],
+                D,
+                dt_bias,
+                torch.tensor([o - start for o in offsets], dtype=i32, device=device),
+                ref_out,
+                ref_cache,
+                slots,
+                has if bool(has.any()) else None,
+            )
+        return ref_cache, ref_out
+
+    def run():
+        mamba_chunk_scan_flashinfer_static(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            dt_bias,
+            cu_seqlens_fi,
+            out,
+            cache,
+            state_indices,
+            has_initial,
+            num_seqs,
+        )
+
+    stream = torch.cuda.Stream()
+    stage(num_decode_tokens)
+    with torch.cuda.stream(stream):
+        run()  # warmup outside the capture, as the mixer's SSD warmup does
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+
+    for start in (num_decode_tokens, num_decode_tokens + 1):
+        if start + sum(seqlens) > num_tokens:
+            continue
+        slots, offsets = stage(start)
+        ref_cache, ref_out = reference(slots, offsets)
+        graph.replay()
+        torch.accelerator.synchronize()
+        if batch:
+            # The batch layout changes FlashInfer's segmentation: bf16
+            # rounding of a few outputs differs.
+            torch.testing.assert_close(
+                out[offsets[0] : offsets[-1]], ref_out, atol=6e-2, rtol=5e-2
+            )
+        torch.testing.assert_close(cache, ref_cache, atol=2e-2, rtol=2e-2)
+        untouched = torch.ones(num_cache_slots, dtype=torch.bool, device=device)
+        untouched[slots.long()] = False
+        assert torch.equal(cache[untouched], ref_cache[untouched])
