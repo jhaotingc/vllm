@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The static-shape SSD launch of a piecewise-captured Mamba2 mixer (whole
 padded token buffer, padded sequences and chunks, initial states read from the
-state cache through indices) must match the dynamic launch on the prefill
-tokens exactly."""
+state cache through indices, a fixed number of programs striding over the real
+chunks and sequences) must match the dynamic launch on the prefill tokens
+exactly."""
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.mamba2_attn import mamba2_static_ssd_grids
 
 if not current_platform.is_cuda():
     pytest.skip("CUDA only", allow_module_level=True)
@@ -53,7 +55,12 @@ def _chunk_metadata(seqlens: list[int], computed: list[int]):
         (0, [128, 128, 1], [128, 0, 1000], 512),
     ],
 )
-def test_static_ssd_matches_dynamic(num_decode_tokens, seqlens, computed, num_tokens):
+# Launch widths (chunk axis, sequence axis); None: the builder's widths;
+# (None, n): one program per static chunk (padding programs exit).
+@pytest.mark.parametrize("grids", [None, (1, 1), (3, 2), (None, 4)])
+def test_static_ssd_matches_dynamic(
+    num_decode_tokens, seqlens, computed, num_tokens, grids
+):
     set_random_seed(0)
     device = torch.device("cuda")
     bf16, f16 = torch.bfloat16, torch.float16
@@ -111,6 +118,9 @@ def test_static_ssd_matches_dynamic(num_decode_tokens, seqlens, computed, num_to
     seq_slots = min(MAX_SEQS, num_tokens)
     num_chunks = -(-num_tokens // CHUNK_SIZE) + 2 * seq_slots
     pad_chunks = num_chunks - len(seq_idx)
+    chunk_grid, seq_grid = grids or mamba2_static_ssd_grids(
+        num_tokens, seq_slots, num_chunks, CHUNK_SIZE
+    )
     as_i32 = lambda v: torch.tensor(v, dtype=torch.int32, device=device)  # noqa: E731
     cu_seqlens = [start + c for c in [0, *torch.tensor(seqlens).cumsum(0).tolist()]]
     static_slots = torch.full((seq_slots,), -1, dtype=torch.int32, device=device)
@@ -139,7 +149,11 @@ def test_static_ssd_matches_dynamic(num_decode_tokens, seqlens, computed, num_to
         state_dtype=f16,
         final_states_out=cache,
         final_state_indices=static_slots,
-        has_pad_chunks=True,
+        num_chunks=None if chunk_grid is None else as_i32([len(seq_idx)]),
+        chunk_grid=chunk_grid,
+        has_pad_chunks=chunk_grid is None,
+        num_seqs=as_i32([num_seqs]),
+        seq_grid=seq_grid,
     )
 
     # Same chunks and kernels: bitwise equal. Padding, decode rows, other

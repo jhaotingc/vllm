@@ -17,19 +17,10 @@ from vllm.triton_utils import tl, triton
 from .mamba_ssm import softplus
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_H": 2}),
-        triton.Config({"BLOCK_SIZE_H": 4}),
-        triton.Config({"BLOCK_SIZE_H": 8}),
-        triton.Config({"BLOCK_SIZE_H": 16}),
-        triton.Config({"BLOCK_SIZE_H": 32}),
-        triton.Config({"BLOCK_SIZE_H": 64}),
-    ],
-    key=["chunk_size", "nheads"],
-)
 @triton.jit
-def _chunk_cumsum_fwd_kernel(
+def _chunk_cumsum_fwd_body(
+    pid_c,
+    pid_h,
     # Pointers to matrices
     dt_ptr,
     A_ptr,
@@ -43,34 +34,24 @@ def _chunk_cumsum_fwd_kernel(
     dt_min: tl.constexpr,
     dt_max: tl.constexpr,
     # Strides
-    stride_dt_seqlen: tl.int64,
+    stride_dt_seqlen,
     stride_dt_head: tl.constexpr,
     stride_A_head: tl.constexpr,
     stride_dt_bias_head: tl.constexpr,
-    stride_dt_out_head: tl.int64,
-    stride_dt_out_chunk: tl.int64,
+    stride_dt_out_head,
+    stride_dt_out_chunk,
     stride_dt_out_csize: tl.constexpr,
-    stride_dA_cs_head: tl.int64,
-    stride_dA_cs_chunk: tl.int64,
+    stride_dA_cs_head,
+    stride_dA_cs_chunk,
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
-    HAS_PAD_CHUNKS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
-    # if dt is long, may cause problems, so use 64 bit
-    # https://github.com/triton-lang/triton/issues/1058
-    pid_c = tl.program_id(axis=0).to(tl.int64)
-    pid_h = tl.program_id(axis=1)
-
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
-    # Static-shape launches end with unused chunks, marked by a negative end
-    # boundary.
-    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
-        return
 
     dt_ptr += chunk_seqlen_start * stride_dt_seqlen
     dt_out_ptr += pid_c * stride_dt_out_chunk
@@ -120,6 +101,130 @@ def _chunk_cumsum_fwd_kernel(
         dA_cs,
         mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size),
     )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_H": 2}),
+        triton.Config({"BLOCK_SIZE_H": 4}),
+        triton.Config({"BLOCK_SIZE_H": 8}),
+        triton.Config({"BLOCK_SIZE_H": 16}),
+        triton.Config({"BLOCK_SIZE_H": 32}),
+        triton.Config({"BLOCK_SIZE_H": 64}),
+    ],
+    key=["chunk_size", "nheads"],
+)
+@triton.jit
+def _chunk_cumsum_fwd_kernel(
+    # Pointers to matrices
+    dt_ptr,
+    A_ptr,
+    dt_bias_ptr,
+    dt_out_ptr,
+    dA_cumsum_ptr,
+    cu_chunk_seqlens_ptr,
+    num_chunks_ptr,
+    # Matrix dimension
+    nheads: tl.constexpr,
+    chunk_size: tl.constexpr,
+    dt_min: tl.constexpr,
+    dt_max: tl.constexpr,
+    # Strides
+    stride_dt_seqlen: tl.int64,
+    stride_dt_head: tl.constexpr,
+    stride_A_head: tl.constexpr,
+    stride_dt_bias_head: tl.constexpr,
+    stride_dt_out_head: tl.int64,
+    stride_dt_out_chunk: tl.int64,
+    stride_dt_out_csize: tl.constexpr,
+    stride_dA_cs_head: tl.int64,
+    stride_dA_cs_chunk: tl.int64,
+    stride_dA_cs_csize: tl.constexpr,
+    # Meta-parameters
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    CHUNK_LOOP: tl.constexpr,
+    HAS_PAD_CHUNKS: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_CHUNK: tl.constexpr,
+):
+    pid_h = tl.program_id(axis=1)
+    if CHUNK_LOOP:
+        # Static-shape launch: a fixed number of programs strides over the
+        # step's real chunks, whose count is read from the device.
+        num_chunks = tl.load(num_chunks_ptr)
+        for pid_c in tl.range(
+            tl.program_id(axis=0),
+            num_chunks,
+            tl.num_programs(axis=0),
+            num_stages=1,
+        ):
+            _chunk_cumsum_fwd_body(
+                # if dt is long, may cause problems, so use 64 bit
+                # https://github.com/triton-lang/triton/issues/1058
+                pid_c.to(tl.int64),
+                pid_h,
+                dt_ptr,
+                A_ptr,
+                dt_bias_ptr,
+                dt_out_ptr,
+                dA_cumsum_ptr,
+                cu_chunk_seqlens_ptr,
+                nheads,
+                chunk_size,
+                dt_min,
+                dt_max,
+                stride_dt_seqlen,
+                stride_dt_head,
+                stride_A_head,
+                stride_dt_bias_head,
+                stride_dt_out_head,
+                stride_dt_out_chunk,
+                stride_dt_out_csize,
+                stride_dA_cs_head,
+                stride_dA_cs_chunk,
+                stride_dA_cs_csize,
+                DT_SOFTPLUS,
+                HAS_DT_BIAS,
+                BLOCK_SIZE_H,
+                BLOCK_SIZE_CHUNK,
+            )
+    else:
+        # Static-shape launches without the chunk loop end with unused
+        # chunks, marked by a negative end boundary.
+        if (
+            HAS_PAD_CHUNKS
+            and tl.load(cu_chunk_seqlens_ptr + tl.program_id(axis=0) + 1) < 0
+        ):
+            return
+        _chunk_cumsum_fwd_body(
+            tl.program_id(axis=0).to(tl.int64),
+            pid_h,
+            dt_ptr,
+            A_ptr,
+            dt_bias_ptr,
+            dt_out_ptr,
+            dA_cumsum_ptr,
+            cu_chunk_seqlens_ptr,
+            nheads,
+            chunk_size,
+            dt_min,
+            dt_max,
+            stride_dt_seqlen,
+            stride_dt_head,
+            stride_A_head,
+            stride_dt_bias_head,
+            stride_dt_out_head,
+            stride_dt_out_chunk,
+            stride_dt_out_csize,
+            stride_dA_cs_head,
+            stride_dA_cs_chunk,
+            stride_dA_cs_csize,
+            DT_SOFTPLUS,
+            HAS_DT_BIAS,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_CHUNK,
+        )
 
 
 @triton.autotune(
@@ -209,6 +314,7 @@ def _chunk_state_fwd_kernel(
     dt_ptr,
     dA_cumsum_ptr,
     cu_chunk_seqlens_ptr,
+    num_chunks_ptr,
     # Matrix dimensions
     hdim: tl.constexpr,
     dstate: tl.constexpr,
@@ -232,22 +338,148 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_chunk: tl.int64,
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
+    CHUNK_LOOP: tl.constexpr,
     HAS_PAD_CHUNKS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
+    if CHUNK_LOOP:
+        # Static-shape launch: a fixed number of programs strides over the
+        # step's real chunks, whose count is read from the device.
+        num_chunks = tl.load(num_chunks_ptr)
+        for pid_c in tl.range(
+            tl.program_id(axis=1),
+            num_chunks,
+            tl.num_programs(axis=1),
+            num_stages=1,
+        ):
+            _chunk_state_fwd_body(
+                pid_c.to(tl.int64),
+                pid_h,
+                pid_m,
+                pid_n,
+                x_ptr,
+                b_ptr,
+                states_ptr,
+                dt_ptr,
+                dA_cumsum_ptr,
+                cu_chunk_seqlens_ptr,
+                hdim,
+                dstate,
+                chunk_size,
+                nheads_ngroups_ratio,
+                stride_x_seqlen,
+                stride_x_head,
+                stride_x_hdim,
+                stride_b_seqlen,
+                stride_b_head,
+                stride_b_dstate,
+                stride_states_chunk,
+                stride_states_head,
+                stride_states_hdim,
+                stride_states_dstate,
+                stride_dt_head,
+                stride_dt_chunk,
+                stride_dt_csize,
+                stride_dA_cs_head,
+                stride_dA_cs_chunk,
+                stride_dA_cs_csize,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+            )
+    else:
+        # Static-shape launches without the chunk loop end with unused
+        # chunks, marked by a negative end boundary.
+        if (
+            HAS_PAD_CHUNKS
+            and tl.load(cu_chunk_seqlens_ptr + tl.program_id(axis=1) + 1) < 0
+        ):
+            return
+        _chunk_state_fwd_body(
+            tl.program_id(axis=1).to(tl.int64),
+            pid_h,
+            pid_m,
+            pid_n,
+            x_ptr,
+            b_ptr,
+            states_ptr,
+            dt_ptr,
+            dA_cumsum_ptr,
+            cu_chunk_seqlens_ptr,
+            hdim,
+            dstate,
+            chunk_size,
+            nheads_ngroups_ratio,
+            stride_x_seqlen,
+            stride_x_head,
+            stride_x_hdim,
+            stride_b_seqlen,
+            stride_b_head,
+            stride_b_dstate,
+            stride_states_chunk,
+            stride_states_head,
+            stride_states_hdim,
+            stride_states_dstate,
+            stride_dt_head,
+            stride_dt_chunk,
+            stride_dt_csize,
+            stride_dA_cs_head,
+            stride_dA_cs_chunk,
+            stride_dA_cs_csize,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+        )
+
+
+@triton.jit
+def _chunk_state_fwd_body(
+    pid_c,
+    pid_h,
+    pid_m,
+    pid_n,
+    # Pointers to matrices
+    x_ptr,
+    b_ptr,
+    states_ptr,
+    dt_ptr,
+    dA_cumsum_ptr,
+    cu_chunk_seqlens_ptr,
+    # Matrix dimensions
+    hdim: tl.constexpr,
+    dstate: tl.constexpr,
+    chunk_size: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # Strides
+    stride_x_seqlen,
+    stride_x_head,
+    stride_x_hdim: tl.constexpr,
+    stride_b_seqlen,
+    stride_b_head,
+    stride_b_dstate: tl.constexpr,
+    stride_states_chunk,
+    stride_states_head,
+    stride_states_hdim,
+    stride_states_dstate: tl.constexpr,
+    stride_dt_head,
+    stride_dt_chunk,
+    stride_dt_csize: tl.constexpr,
+    stride_dA_cs_head,
+    stride_dA_cs_chunk,
+    stride_dA_cs_csize: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
-    # Static-shape launches end with unused chunks, marked by a negative end
-    # boundary.
-    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
-        return
     b_ptr += (
         chunk_seqlen_start * stride_b_seqlen
         + (pid_h // nheads_ngroups_ratio) * stride_b_head
@@ -321,8 +553,13 @@ def _chunk_cumsum_fwd(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    num_chunks=None,
+    chunk_grid=None,
     has_pad_chunks=False,
 ):
+    """`num_chunks` (one-element int32 device tensor), if given, is the number
+    of real chunks at the front of `cu_chunk_seqlens` (the rest is static
+    padding); `chunk_grid` programs then stride over them."""
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
@@ -334,7 +571,8 @@ def _chunk_cumsum_fwd(
     dA_cumsum = torch.empty(
         nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
     )
-    grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
+    grid_c = nchunks if num_chunks is None else chunk_grid
+    grid_chunk_cs = lambda META: (grid_c, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
     launch_autotuned(
         _chunk_cumsum_fwd_kernel,
         grid_chunk_cs,
@@ -352,6 +590,7 @@ def _chunk_cumsum_fwd(
         dt_out_ptr=dt_out,
         dA_cumsum_ptr=dA_cumsum,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        num_chunks_ptr=num_chunks,
         nheads=nheads,
         chunk_size=chunk_size,
         dt_min=dt_limit[0],
@@ -368,6 +607,7 @@ def _chunk_cumsum_fwd(
         stride_dA_cs_csize=dA_cumsum.stride(2),
         DT_SOFTPLUS=dt_softplus,
         HAS_DT_BIAS=dt_bias is not None,
+        CHUNK_LOOP=num_chunks is not None,
         HAS_PAD_CHUNKS=has_pad_chunks,
         BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
     )
@@ -382,8 +622,11 @@ def _chunk_state_fwd(
     cu_chunk_seqlens,
     states=None,
     states_in_fp32=True,
+    num_chunks=None,
+    chunk_grid=None,
     has_pad_chunks=False,
 ):
+    """`num_chunks`/`chunk_grid`: see `_chunk_cumsum_fwd`."""
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -400,10 +643,11 @@ def _chunk_state_fwd(
             (nchunks, nheads, headdim, dstate), device=x.device, dtype=states_dtype
         )
 
+    grid_c = nchunks if num_chunks is None else chunk_grid
     grid = lambda META: (
         triton.cdiv(headdim, META["BLOCK_SIZE_M"])
         * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
-        nchunks,
+        grid_c,
         nheads,
     )
     launch_autotuned(
@@ -426,6 +670,7 @@ def _chunk_state_fwd(
         dt_ptr=dt,
         dA_cumsum_ptr=dA_cumsum,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        num_chunks_ptr=num_chunks,
         hdim=headdim,
         dstate=dstate,
         chunk_size=chunk_size,
@@ -446,6 +691,7 @@ def _chunk_state_fwd(
         stride_dA_cs_head=dA_cumsum.stride(0),
         stride_dA_cs_chunk=dA_cumsum.stride(1),
         stride_dA_cs_csize=dA_cumsum.stride(2),
+        CHUNK_LOOP=num_chunks is not None,
         HAS_PAD_CHUNKS=has_pad_chunks,
     )
     return states

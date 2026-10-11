@@ -164,6 +164,7 @@ def _chunk_scan_fwd_kernel(
     initstates_indices_ptr,
     has_initstates_ptr,
     cu_chunk_seqlens_ptr,
+    num_chunks_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
     hdim: tl.constexpr,
@@ -216,20 +217,248 @@ def _chunk_scan_fwd_kernel(
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
     INITSTATES_INDEXED: tl.constexpr,
+    CHUNK_LOOP: tl.constexpr,
     HAS_PAD_CHUNKS: tl.constexpr,
 ):
-    pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
+    if CHUNK_LOOP:
+        # Static-shape launch: a fixed number of programs strides over the
+        # step's real entries, whose count is read from the device.
+        num_iters = tl.load(num_chunks_ptr)
+        for pid_c in tl.range(
+            tl.program_id(axis=1),
+            num_iters,
+            tl.num_programs(axis=1),
+            num_stages=1,
+        ):
+            _chunk_scan_fwd_body(
+                pid_c.to(tl.int64),
+                pid_h,
+                pid_m,
+                pid_n,
+                cb_ptr,
+                x_ptr,
+                z_ptr,
+                out_ptr,
+                dt_ptr,
+                dA_cumsum_ptr,
+                seq_idx_ptr,
+                C_ptr,
+                states_ptr,
+                D_ptr,
+                initstates_ptr,
+                initstates_indices_ptr,
+                has_initstates_ptr,
+                cu_chunk_seqlens_ptr,
+                chunk_size,
+                hdim,
+                dstate,
+                nheads_ngroups_ratio,
+                stride_cb_chunk,
+                stride_cb_head,
+                stride_cb_csize_m,
+                stride_cb_csize_k,
+                stride_x_seqlen,
+                stride_x_head,
+                stride_x_hdim,
+                stride_z_seqlen,
+                stride_z_head,
+                stride_z_hdim,
+                stride_out_seqlen,
+                stride_out_head,
+                stride_out_hdim,
+                stride_dt_chunk,
+                stride_dt_head,
+                stride_dt_csize,
+                stride_dA_cs_chunk,
+                stride_dA_cs_head,
+                stride_dA_cs_csize,
+                stride_seq_idx_chunk,
+                stride_C_seqlen,
+                stride_C_head,
+                stride_C_dstate,
+                stride_states_chunk,
+                stride_states_head,
+                stride_states_hdim,
+                stride_states_dstate,
+                stride_init_states_batch,
+                stride_init_states_head,
+                stride_init_states_hdim,
+                stride_init_states_dstate,
+                stride_D_head,
+                stride_initstates_indices,
+                stride_has_initstates,
+                IS_CAUSAL,
+                HAS_D,
+                D_HAS_HDIM,
+                HAS_Z,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                BLOCK_SIZE_DSTATE,
+                IS_TRITON_22,
+                HAS_INITSTATES,
+                INITSTATES_INDEXED,
+            )
+    else:
+        # Static-shape launches without the chunk loop end with unused
+        # chunks, marked by a negative end boundary.
+        if (
+            HAS_PAD_CHUNKS
+            and tl.load(cu_chunk_seqlens_ptr + tl.program_id(axis=1) + 1) < 0
+        ):
+            return
+        _chunk_scan_fwd_body(
+            tl.program_id(axis=1).to(tl.int64),
+            pid_h,
+            pid_m,
+            pid_n,
+            cb_ptr,
+            x_ptr,
+            z_ptr,
+            out_ptr,
+            dt_ptr,
+            dA_cumsum_ptr,
+            seq_idx_ptr,
+            C_ptr,
+            states_ptr,
+            D_ptr,
+            initstates_ptr,
+            initstates_indices_ptr,
+            has_initstates_ptr,
+            cu_chunk_seqlens_ptr,
+            chunk_size,
+            hdim,
+            dstate,
+            nheads_ngroups_ratio,
+            stride_cb_chunk,
+            stride_cb_head,
+            stride_cb_csize_m,
+            stride_cb_csize_k,
+            stride_x_seqlen,
+            stride_x_head,
+            stride_x_hdim,
+            stride_z_seqlen,
+            stride_z_head,
+            stride_z_hdim,
+            stride_out_seqlen,
+            stride_out_head,
+            stride_out_hdim,
+            stride_dt_chunk,
+            stride_dt_head,
+            stride_dt_csize,
+            stride_dA_cs_chunk,
+            stride_dA_cs_head,
+            stride_dA_cs_csize,
+            stride_seq_idx_chunk,
+            stride_C_seqlen,
+            stride_C_head,
+            stride_C_dstate,
+            stride_states_chunk,
+            stride_states_head,
+            stride_states_hdim,
+            stride_states_dstate,
+            stride_init_states_batch,
+            stride_init_states_head,
+            stride_init_states_hdim,
+            stride_init_states_dstate,
+            stride_D_head,
+            stride_initstates_indices,
+            stride_has_initstates,
+            IS_CAUSAL,
+            HAS_D,
+            D_HAS_HDIM,
+            HAS_Z,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            BLOCK_SIZE_DSTATE,
+            IS_TRITON_22,
+            HAS_INITSTATES,
+            INITSTATES_INDEXED,
+        )
+
+
+@triton.jit
+def _chunk_scan_fwd_body(
+    pid_c,
+    pid_h,
+    pid_m,
+    pid_n,
+    # Pointers to matrices
+    cb_ptr,
+    x_ptr,
+    z_ptr,
+    out_ptr,
+    dt_ptr,
+    dA_cumsum_ptr,
+    seq_idx_ptr,
+    C_ptr,
+    states_ptr,
+    D_ptr,
+    initstates_ptr,
+    initstates_indices_ptr,
+    has_initstates_ptr,
+    cu_chunk_seqlens_ptr,
+    # Matrix dimensions
+    chunk_size: tl.constexpr,
+    hdim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # Strides
+    stride_cb_chunk,
+    stride_cb_head,
+    stride_cb_csize_m,
+    stride_cb_csize_k: tl.constexpr,
+    stride_x_seqlen,
+    stride_x_head,
+    stride_x_hdim: tl.constexpr,
+    stride_z_seqlen,
+    stride_z_head,
+    stride_z_hdim: tl.constexpr,
+    stride_out_seqlen,
+    stride_out_head,
+    stride_out_hdim: tl.constexpr,
+    stride_dt_chunk,
+    stride_dt_head,
+    stride_dt_csize: tl.constexpr,
+    stride_dA_cs_chunk,
+    stride_dA_cs_head,
+    stride_dA_cs_csize: tl.constexpr,
+    stride_seq_idx_chunk: tl.constexpr,
+    stride_C_seqlen,
+    stride_C_head,
+    stride_C_dstate: tl.constexpr,
+    stride_states_chunk,
+    stride_states_head,
+    stride_states_hdim,
+    stride_states_dstate: tl.constexpr,
+    stride_init_states_batch,
+    stride_init_states_head,
+    stride_init_states_hdim,
+    stride_init_states_dstate: tl.constexpr,
+    stride_D_head: tl.constexpr,
+    stride_initstates_indices,
+    stride_has_initstates,
+    # Meta-parameters
+    IS_CAUSAL: tl.constexpr,
+    HAS_D: tl.constexpr,
+    D_HAS_HDIM: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    IS_TRITON_22: tl.constexpr,
+    HAS_INITSTATES: tl.constexpr,
+    INITSTATES_INDEXED: tl.constexpr,
+):
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
-    # Static-shape launches end with unused chunks, marked by a negative end
-    # boundary.
-    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
-        return
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
@@ -457,11 +686,15 @@ def _chunk_scan_fwd(
     initial_states=None,
     initial_state_indices=None,
     has_initial_states=None,
+    num_chunks=None,
+    chunk_grid=None,
     has_pad_chunks=False,
 ):
     """With `initial_state_indices`, `initial_states` is the state cache and
     sequence b starts from slot `initial_state_indices[b]` when
-    `has_initial_states[b]` is set, else from zero."""
+    `has_initial_states[b]` is set, else from zero. `num_chunks` (one-element
+    int32 device tensor), if given, is the number of real chunks at the front
+    of `cu_chunk_seqlens`; `chunk_grid` programs then stride over them."""
     assert seq_idx is not None, "this implementation requires seq_idx"
 
     seqlen, nheads, headdim = x.shape
@@ -479,10 +712,11 @@ def _chunk_scan_fwd(
     assert states.shape == (nchunks, nheads, headdim, dstate)
     assert seq_idx.shape == (nchunks,)
 
+    grid_c = nchunks if num_chunks is None else chunk_grid
     grid = lambda META: (
         triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
         * triton.cdiv(headdim, META["BLOCK_SIZE_N"]),
-        nchunks,
+        grid_c,
         nheads,
     )
 
@@ -534,6 +768,7 @@ def _chunk_scan_fwd(
         initstates_indices_ptr=initial_state_indices,
         has_initstates_ptr=has_initial_states,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        num_chunks_ptr=num_chunks,
         chunk_size=chunk_size,
         hdim=headdim,
         dstate=dstate,
@@ -584,6 +819,7 @@ def _chunk_scan_fwd(
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
         INITSTATES_INDEXED=initial_state_indices is not None,
+        CHUNK_LOOP=num_chunks is not None,
         HAS_PAD_CHUNKS=has_pad_chunks,
     )
     return

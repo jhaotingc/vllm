@@ -27,6 +27,17 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 # causal_conv1d_fn processes this many tokens of a sequence per program.
 _CONV1D_BLOCK_M = 8
+# Programs per (tile, head) along the sequence axis of the static SSD's
+# per-sequence kernels, and extra programs (two per such sequence) along the
+# chunk axis of its chunk-parallel kernels. Real sequences or chunks beyond
+# these are covered by the programs looping, so typical steps (up to this many
+# prefills) need one pass while worst-case shapes cost nothing extra.
+_STATIC_SSD_LOOP_SEQS = 16
+# The chunk-parallel kernels stride over the real chunks only up to this many
+# padded tokens. Their strided bodies need more registers, which outweighs the
+# saved programs once a step has hundreds of real chunks; larger launches keep
+# one program per static chunk, the unused ones exiting at once.
+_STATIC_SSD_CHUNK_LOOP_MAX_TOKENS = 8192
 
 
 def compute_varlen_chunk_metadata(
@@ -126,6 +137,22 @@ def mamba2_static_sizes(
     return num_seqs, num_chunks, num_conv_programs, num_decode_rows
 
 
+def mamba2_static_ssd_grids(
+    num_tokens: int, num_seqs: int, num_chunks: int, chunk_size: int
+) -> tuple[int | None, int]:
+    """Launch widths of the static SSD kernels: (programs along the chunk
+    axis, or None for one program per static chunk; programs along the
+    sequence axis). Strided kernels loop over the step's real chunks or
+    sequences, so these only set the parallelism."""
+    seq_grid = min(num_seqs, _STATIC_SSD_LOOP_SEQS)
+    if num_tokens > _STATIC_SSD_CHUNK_LOOP_MAX_TOKENS:
+        return None, seq_grid
+    chunk_grid = min(
+        num_chunks, cdiv(num_tokens, chunk_size) + 2 * _STATIC_SSD_LOOP_SEQS
+    )
+    return chunk_grid, seq_grid
+
+
 @dataclass
 class Mamba2StaticMetadata:
     """Fixed-shape metadata of a Mamba2 mixer captured in a piecewise CUDA
@@ -148,6 +175,12 @@ class Mamba2StaticMetadata:
     cu_chunk_seqlens_p: torch.Tensor  # (num_chunks + 1,) int32
     seq_idx_p: torch.Tensor  # (num_chunks,) int32
     last_chunk_indices_p: torch.Tensor  # (num_seqs,) int32
+    # Real prefill sequences and chunks of this step (the rest is padding),
+    # and the launch widths of the SSD kernels that stride over them.
+    num_seqs_p: torch.Tensor  # (1,) int32
+    num_chunks_p: torch.Tensor  # (1,) int32
+    seq_grid: int
+    chunk_grid: int | None  # None: one program per static chunk
     # causal_conv1d_fn launch metadata (it reads these attribute names).
     nums_dict: dict[int, dict[str, Any]]
     batch_ptr: torch.Tensor  # (num_conv_programs,) int32
@@ -228,6 +261,8 @@ class Mamba2AttentionMetadataBuilder(
                 "cu_chunk_seqlens_p": num_chunks + 1,
                 "seq_idx_p": num_chunks,
                 "last_chunk_indices_p": num_seqs,
+                "num_seqs_p": 1,
+                "num_chunks_p": 1,
                 "batch_ptr": num_conv_programs,
                 "token_chunk_offset_ptr": num_conv_programs,
                 "query_start_loc_d": num_decode_rows + 1,
@@ -338,6 +373,9 @@ class Mamba2AttentionMetadataBuilder(
             self.decode_cudagraph_max_bs,
             self.chunk_size,
         )
+        chunk_grid, seq_grid = mamba2_static_ssd_grids(
+            num_tokens, num_seqs, num_chunks, self.chunk_size
+        )
         num_decodes = metadata.num_decodes
         num_prefills = metadata.num_prefills
         num_decode_tokens = metadata.num_decode_tokens
@@ -379,6 +417,8 @@ class Mamba2AttentionMetadataBuilder(
         last_chunks = segment("last_chunk_indices_p", num_seqs)
         last_chunks[:num_prefills] = last_chunk_indices
         last_chunks[num_prefills:] = num_real_chunks - 1
+        segment("num_seqs_p", 1)[0] = num_prefills
+        segment("num_chunks_p", 1)[0] = num_real_chunks
         # causal_conv1d_fn: one program per _CONV1D_BLOCK_M tokens of a prefill.
         seqlens = np.diff(qsl_p[: num_prefills + 1])
         programs = -(-seqlens // _CONV1D_BLOCK_M)
@@ -433,6 +473,10 @@ class Mamba2AttentionMetadataBuilder(
             cu_chunk_seqlens_p=view("cu_chunk_seqlens_p", num_chunks + 1),
             seq_idx_p=view("seq_idx_p", num_chunks),
             last_chunk_indices_p=view("last_chunk_indices_p", num_seqs),
+            num_seqs_p=view("num_seqs_p", 1),
+            num_chunks_p=view("num_chunks_p", 1),
+            seq_grid=seq_grid,
+            chunk_grid=chunk_grid,
             nums_dict={
                 _CONV1D_BLOCK_M: {
                     "tot": num_conv_programs,

@@ -38,6 +38,7 @@ def _state_passing_fwd_kernel(
     initstates_indices_ptr,
     has_initstates_ptr,
     last_chunk_indices_ptr,
+    num_seqs_ptr,
     final_states_ptr,
     final_state_indices_ptr,
     # Matrix dimensions
@@ -67,11 +68,142 @@ def _state_passing_fwd_kernel(
     INITSTATES_INDEXED: tl.constexpr,
     HAS_FINAL_STATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    SEQ_LOOP: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
-    pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
+    if SEQ_LOOP:
+        # Static-shape launch: a fixed number of programs strides over the
+        # step's real entries, whose count is read from the device.
+        num_iters = tl.load(num_seqs_ptr)
+        for pid_b in tl.range(
+            tl.program_id(axis=1),
+            num_iters,
+            tl.num_programs(axis=1),
+            num_stages=1,
+        ):
+            _state_passing_fwd_body(
+                pid_b,
+                pid_m,
+                pid_h,
+                states_ptr,
+                out_ptr,
+                dA_cs_ptr,
+                initstates_ptr,
+                initstates_indices_ptr,
+                has_initstates_ptr,
+                last_chunk_indices_ptr,
+                final_states_ptr,
+                final_state_indices_ptr,
+                dim,
+                chunk_size,
+                stride_states_chunk,
+                stride_states_head,
+                stride_states_dim,
+                stride_out_chunk,
+                stride_out_head,
+                stride_out_dim,
+                stride_dA_cs_head,
+                stride_dA_cs_chunk,
+                stride_dA_cs_csize,
+                stride_initstates_batch,
+                stride_initstates_head,
+                stride_initstates_dim,
+                stride_final_states_slot,
+                stride_final_states_head,
+                stride_final_states_dim,
+                stride_final_state_indices,
+                stride_initstates_indices,
+                stride_has_initstates,
+                HAS_INITSTATES,
+                INITSTATES_INDEXED,
+                HAS_FINAL_STATES,
+                BLOCK_SIZE,
+            )
+    else:
+        _state_passing_fwd_body(
+            tl.program_id(axis=1),
+            pid_m,
+            pid_h,
+            states_ptr,
+            out_ptr,
+            dA_cs_ptr,
+            initstates_ptr,
+            initstates_indices_ptr,
+            has_initstates_ptr,
+            last_chunk_indices_ptr,
+            final_states_ptr,
+            final_state_indices_ptr,
+            dim,
+            chunk_size,
+            stride_states_chunk,
+            stride_states_head,
+            stride_states_dim,
+            stride_out_chunk,
+            stride_out_head,
+            stride_out_dim,
+            stride_dA_cs_head,
+            stride_dA_cs_chunk,
+            stride_dA_cs_csize,
+            stride_initstates_batch,
+            stride_initstates_head,
+            stride_initstates_dim,
+            stride_final_states_slot,
+            stride_final_states_head,
+            stride_final_states_dim,
+            stride_final_state_indices,
+            stride_initstates_indices,
+            stride_has_initstates,
+            HAS_INITSTATES,
+            INITSTATES_INDEXED,
+            HAS_FINAL_STATES,
+            BLOCK_SIZE,
+        )
 
+
+@triton.jit
+def _state_passing_fwd_body(
+    pid_b,
+    pid_m,
+    pid_h,
+    # Pointers to matrices
+    states_ptr,
+    out_ptr,
+    dA_cs_ptr,
+    initstates_ptr,
+    initstates_indices_ptr,
+    has_initstates_ptr,
+    last_chunk_indices_ptr,
+    final_states_ptr,
+    final_state_indices_ptr,
+    # Matrix dimensions
+    dim: tl.constexpr,
+    chunk_size: tl.constexpr,
+    # Strides
+    stride_states_chunk,
+    stride_states_head,
+    stride_states_dim: tl.constexpr,
+    stride_out_chunk,
+    stride_out_head,
+    stride_out_dim: tl.constexpr,
+    stride_dA_cs_head,
+    stride_dA_cs_chunk,
+    stride_dA_cs_csize: tl.constexpr,
+    stride_initstates_batch,
+    stride_initstates_head,
+    stride_initstates_dim: tl.constexpr,
+    stride_final_states_slot,
+    stride_final_states_head,
+    stride_final_states_dim: tl.constexpr,
+    stride_final_state_indices,
+    stride_initstates_indices,
+    stride_has_initstates,
+    # Meta-parameters
+    HAS_INITSTATES: tl.constexpr,
+    INITSTATES_INDEXED: tl.constexpr,
+    HAS_FINAL_STATES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
     # Derive this sequence's chunk range from last_chunk_indices
     chunk_end = tl.load(last_chunk_indices_ptr + pid_b) + 1
     chunk_start = (
@@ -148,6 +280,7 @@ def _write_final_states_kernel(
     last_chunk_indices_ptr,
     final_states_ptr,
     final_state_indices_ptr,
+    num_seqs_ptr,
     dim: tl.constexpr,
     stride_states_chunk: tl.int64,
     stride_states_head: tl.int64,
@@ -156,25 +289,92 @@ def _write_final_states_kernel(
     stride_final_states_head: tl.int64,
     stride_final_states_dim: tl.constexpr,
     stride_final_state_indices,
+    SEQ_LOOP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
-    pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
+    if SEQ_LOOP:
+        # Static-shape launch: a fixed number of programs strides over the
+        # step's real sequences, whose count is read from the device.
+        num_seqs = tl.load(num_seqs_ptr)
+        for pid_b in tl.range(
+            tl.program_id(axis=1),
+            num_seqs,
+            tl.num_programs(axis=1),
+            num_stages=1,
+        ):
+            _write_final_state(
+                pid_b,
+                pid_m,
+                pid_h,
+                states_ptr,
+                last_chunk_indices_ptr,
+                final_states_ptr,
+                final_state_indices_ptr,
+                dim,
+                stride_states_chunk,
+                stride_states_head,
+                stride_states_dim,
+                stride_final_states_slot,
+                stride_final_states_head,
+                stride_final_states_dim,
+                stride_final_state_indices,
+                BLOCK_SIZE,
+            )
+    else:
+        _write_final_state(
+            tl.program_id(axis=1),
+            pid_m,
+            pid_h,
+            states_ptr,
+            last_chunk_indices_ptr,
+            final_states_ptr,
+            final_state_indices_ptr,
+            dim,
+            stride_states_chunk,
+            stride_states_head,
+            stride_states_dim,
+            stride_final_states_slot,
+            stride_final_states_head,
+            stride_final_states_dim,
+            stride_final_state_indices,
+            BLOCK_SIZE,
+        )
+
+
+@triton.jit
+def _write_final_state(
+    pid_b,
+    pid_m,
+    pid_h,
+    states_ptr,
+    last_chunk_indices_ptr,
+    final_states_ptr,
+    final_state_indices_ptr,
+    dim: tl.constexpr,
+    stride_states_chunk,
+    stride_states_head,
+    stride_states_dim: tl.constexpr,
+    stride_final_states_slot,
+    stride_final_states_head,
+    stride_final_states_dim: tl.constexpr,
+    stride_final_state_indices,
+    BLOCK_SIZE: tl.constexpr,
+):
     slot = tl.load(final_state_indices_ptr + pid_b * stride_final_state_indices).to(
         tl.int64
     )
-    # Negative slots mark padded sequences.
-    if slot < 0:
-        return
     last_chunk = tl.load(last_chunk_indices_ptr + pid_b).to(tl.int64)
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # Negative slots mark padded sequences.
+    mask = (offs_m < dim) & (slot >= 0)
     states = tl.load(
         states_ptr
         + last_chunk * stride_states_chunk
         + pid_h * stride_states_head
         + offs_m * stride_states_dim,
-        mask=offs_m < dim,
+        mask=mask,
     )
     tl.store(
         final_states_ptr
@@ -182,24 +382,36 @@ def _write_final_states_kernel(
         + pid_h * stride_final_states_head
         + offs_m * stride_final_states_dim,
         states,
-        mask=offs_m < dim,
+        mask=mask,
     )
 
 
-def _write_final_states(states, last_chunk_indices, final_states, final_state_indices):
+def _write_final_states(
+    states,
+    last_chunk_indices,
+    final_states,
+    final_state_indices,
+    num_seqs=None,
+    seq_grid=None,
+):
     """final_states[final_state_indices[b]] = states[last_chunk_indices[b]],
     skipping negative slots. states: (nchunks, nheads, dim) state-passing
-    output; final_states: (num_slots, nheads, dim) state cache."""
+    output; final_states: (num_slots, nheads, dim) state cache. `num_seqs`
+    (one-element int32 device tensor), if given, is the number of real
+    sequences at the front of the static batch; `seq_grid` programs then
+    stride over them."""
     _, nheads, dim = states.shape
     batch = last_chunk_indices.shape[0]
     assert final_states.shape[1:] == (nheads, dim)
     assert final_state_indices.shape == (batch,)
     block_size = 1024
-    _write_final_states_kernel[(triton.cdiv(dim, block_size), batch, nheads)](
+    grid_b = batch if num_seqs is None else seq_grid
+    _write_final_states_kernel[(triton.cdiv(dim, block_size), grid_b, nheads)](
         states,
         last_chunk_indices,
         final_states,
         final_state_indices,
+        num_seqs,
         dim=dim,
         stride_states_chunk=states.stride(0),
         stride_states_head=states.stride(1),
@@ -208,6 +420,7 @@ def _write_final_states(states, last_chunk_indices, final_states, final_state_in
         stride_final_states_head=final_states.stride(1),
         stride_final_states_dim=final_states.stride(2),
         stride_final_state_indices=final_state_indices.stride(0),
+        SEQ_LOOP=num_seqs is not None,
         BLOCK_SIZE=block_size,
     )
 
@@ -222,12 +435,16 @@ def _state_passing_fwd(
     final_state_indices=None,
     initial_state_indices=None,
     has_initial_states=None,
+    num_seqs=None,
+    seq_grid=None,
 ):
     """`final_states` (num_slots, nheads, dim), if given, receives each
     sequence's final state at slot `final_state_indices[b]` (skipped when
     negative). With `initial_state_indices`, `initial_states` is the state
     cache and sequence b starts from slot `initial_state_indices[b]` when
-    `has_initial_states[b]` is set, else from zero."""
+    `has_initial_states[b]` is set, else from zero. `num_seqs` (one-element
+    int32 device tensor), if given, is the number of real sequences at the
+    front of the static batch; `seq_grid` programs then stride over them."""
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     batch = last_chunk_indices.shape[0]
@@ -250,7 +467,8 @@ def _state_passing_fwd(
         else (0, 0, 0)
     )
 
-    grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), batch, nheads)
+    grid_b = batch if num_seqs is None else seq_grid
+    grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), grid_b, nheads)
     launch_autotuned(
         _state_passing_fwd_kernel,
         grid,
@@ -273,6 +491,7 @@ def _state_passing_fwd(
         initstates_indices_ptr=initial_state_indices,
         has_initstates_ptr=has_initial_states,
         last_chunk_indices_ptr=last_chunk_indices,
+        num_seqs_ptr=num_seqs,
         final_states_ptr=final_states,
         final_state_indices_ptr=final_state_indices,
         dim=dim,
@@ -304,5 +523,6 @@ def _state_passing_fwd(
         HAS_INITSTATES=initial_states is not None,
         INITSTATES_INDEXED=initial_state_indices is not None,
         HAS_FINAL_STATES=final_states is not None,
+        SEQ_LOOP=num_seqs is not None,
     )
     return out

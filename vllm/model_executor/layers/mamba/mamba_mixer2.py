@@ -782,40 +782,48 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         if self.mamba_config.mixed_batch_cudagraph:
             # The piecewise-captured static path reads initial states through
-            # cache indices and pads the chunk list; autotune those launches
-            # here, since autotuning synchronizes and cannot run in a capture.
+            # cache indices and strides over the real chunks and sequences of
+            # a padded launch; autotune and compile those launches here, since
+            # autotuning synchronizes and cannot run in a capture.
             int32 = torch.int32
             pad_cu_chunk_seqlens = torch.tensor(
                 [0, seqlen, -1], device=device, dtype=int32
             )
             pad_seq_idx = torch.tensor([0, -1], device=device, dtype=int32)
             slots = torch.zeros(batch, device=device, dtype=int32)
+            num_chunks = torch.ones(1, device=device, dtype=int32)
+            num_seqs = torch.full((1,), batch, device=device, dtype=int32)
             try:
-                mamba_chunk_scan_combined_varlen(
-                    x=x,
-                    dt=dt,
-                    A=self.A,
-                    B=B,
-                    C=C,
-                    chunk_size=chunk_size,
-                    cu_seqlens=cu_seqlens,
-                    cu_chunk_seqlens=pad_cu_chunk_seqlens,
-                    last_chunk_indices=last_chunk_indices,
-                    seq_idx=pad_seq_idx,
-                    out=out,
-                    D=self.D,
-                    z=None,
-                    dt_bias=self.dt_bias,
-                    initial_states=final_states,
-                    initial_state_indices=slots,
-                    has_initial_states=torch.ones_like(slots),
-                    dt_softplus=True,
-                    dt_limit=(0.0, float("inf")),
-                    state_dtype=ssm_state_dtype,
-                    final_states_out=final_states,
-                    final_state_indices=slots,
-                    has_pad_chunks=True,
-                )
+                for chunk_loop in (True, False):
+                    mamba_chunk_scan_combined_varlen(
+                        x=x,
+                        dt=dt,
+                        A=self.A,
+                        B=B,
+                        C=C,
+                        chunk_size=chunk_size,
+                        cu_seqlens=cu_seqlens,
+                        cu_chunk_seqlens=pad_cu_chunk_seqlens,
+                        last_chunk_indices=last_chunk_indices,
+                        seq_idx=pad_seq_idx,
+                        out=out,
+                        D=self.D,
+                        z=None,
+                        dt_bias=self.dt_bias,
+                        initial_states=final_states,
+                        initial_state_indices=slots,
+                        has_initial_states=torch.ones_like(slots),
+                        dt_softplus=True,
+                        dt_limit=(0.0, float("inf")),
+                        state_dtype=ssm_state_dtype,
+                        final_states_out=final_states,
+                        final_state_indices=slots,
+                        num_chunks=num_chunks if chunk_loop else None,
+                        chunk_grid=2 if chunk_loop else None,
+                        has_pad_chunks=not chunk_loop,
+                        num_seqs=num_seqs,
+                        seq_grid=batch,
+                    )
             except Exception:
                 logger.warning(
                     "Mamba2 static-shape SSD warmup failed for layer %s; CUDA "
@@ -1331,7 +1339,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
             state_dtype=ssm_state.dtype,
             final_states_out=ssm_state,
             final_state_indices=static.state_indices_p,
-            has_pad_chunks=True,
+            num_chunks=None if static.chunk_grid is None else static.num_chunks_p,
+            chunk_grid=static.chunk_grid,
+            has_pad_chunks=static.chunk_grid is None,
+            num_seqs=static.num_seqs_p,
+            seq_grid=static.seq_grid,
         )
         if self._updates_replayssm_trackers:
             reset_replayssm_ring_trackers(

@@ -47,7 +47,11 @@ def _mamba_chunk_scan_combined_fwd(
     final_state_indices=None,
     initial_state_indices=None,
     has_initial_states=None,
+    num_chunks=None,
+    chunk_grid=None,
     has_pad_chunks=False,
+    num_seqs=None,
+    seq_grid=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -104,6 +108,8 @@ def _mamba_chunk_scan_combined_fwd(
         dt_bias=dt_bias,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
+        num_chunks=num_chunks,
+        chunk_grid=chunk_grid,
         has_pad_chunks=has_pad_chunks,
     )
 
@@ -116,6 +122,8 @@ def _mamba_chunk_scan_combined_fwd(
         dA_cumsum,
         cu_chunk_seqlens,
         states_in_fp32=True,
+        num_chunks=num_chunks,
+        chunk_grid=chunk_grid,
         has_pad_chunks=has_pad_chunks,
     )
 
@@ -141,6 +149,8 @@ def _mamba_chunk_scan_combined_fwd(
         final_state_indices=final_state_indices if fuse_final_states else None,
         initial_state_indices=initial_state_indices,
         has_initial_states=has_initial_states,
+        num_seqs=num_seqs,
+        seq_grid=seq_grid,
     )
     states = states.unflatten(-1, (headdim, dstate))
 
@@ -151,6 +161,8 @@ def _mamba_chunk_scan_combined_fwd(
         chunk_size,
         cu_chunk_seqlens,
         output_dtype=torch.float32,
+        num_chunks=num_chunks,
+        chunk_grid=chunk_grid,
         has_pad_chunks=has_pad_chunks,
     )
 
@@ -179,6 +191,8 @@ def _mamba_chunk_scan_combined_fwd(
         initial_states=initial_states,
         initial_state_indices=initial_state_indices,
         has_initial_states=has_initial_states,
+        num_chunks=num_chunks,
+        chunk_grid=chunk_grid,
         has_pad_chunks=has_pad_chunks,
     )
 
@@ -188,6 +202,8 @@ def _mamba_chunk_scan_combined_fwd(
             last_chunk_indices,
             final_states_out.flatten(-2),
             final_state_indices,
+            num_seqs=num_seqs,
+            seq_grid=seq_grid,
         )
 
     if return_intermediate_states:
@@ -222,7 +238,11 @@ def mamba_chunk_scan_combined_varlen(
     final_state_indices=None,
     initial_state_indices=None,
     has_initial_states=None,
+    num_chunks=None,
+    chunk_grid=None,
     has_pad_chunks=False,
+    num_seqs=None,
+    seq_grid=None,
 ):
     """Argument:
         x: (seqlen, nheads, headdim)
@@ -251,8 +271,15 @@ def mamba_chunk_scan_combined_varlen(
             starts from slot initial_state_indices[b] ...
         has_initial_states: (batch,) ... when has_initial_states[b] is set,
             else from zero
-        has_pad_chunks: unused trailing chunks of a static-shape launch are
-            marked by negative cu_chunk_seqlens end boundaries
+        num_chunks: optional one-element int32 device tensor: only the first
+            num_chunks chunks of a static-shape launch are real; chunk_grid
+            programs per chunk-parallel kernel stride over them
+        has_pad_chunks: without num_chunks, unused trailing chunks of a
+            static-shape launch are marked by negative cu_chunk_seqlens end
+            boundaries (one program per chunk; padding programs exit)
+        num_seqs: optional one-element int32 device tensor: only the first
+            num_seqs sequences are real; seq_grid programs per per-sequence
+            kernel stride over them
     Return:
         varlen_states: (batch, nheads, headdim, dstate), or None if written
     """
@@ -284,7 +311,11 @@ def mamba_chunk_scan_combined_varlen(
         final_state_indices=final_state_indices,
         initial_state_indices=initial_state_indices,
         has_initial_states=has_initial_states,
+        num_chunks=num_chunks,
+        chunk_grid=chunk_grid,
         has_pad_chunks=has_pad_chunks,
+        num_seqs=num_seqs,
+        seq_grid=seq_grid,
     )
     if final_states_out is not None:
         if varlen_states is not None:

@@ -69,6 +69,7 @@ def _bmm_chunk_fwd_kernel(
     b_ptr,
     out_ptr,
     cu_chunk_seqlens_ptr,
+    num_chunks_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
     K: tl.constexpr,
@@ -86,27 +87,125 @@ def _bmm_chunk_fwd_kernel(
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
     dot_dtype: tl.constexpr,
+    CHUNK_LOOP: tl.constexpr,
     HAS_PAD_CHUNKS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_ch = tl.program_id(axis=1).to(tl.int64)
-    pid_c = pid_ch // ngroups
-    pid_h = pid_ch - pid_c * ngroups
     num_pid_n = tl.cdiv(chunk_size, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     if IS_CAUSAL:
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
             return
+    if CHUNK_LOOP:
+        # Static-shape launch: a fixed number of programs strides over the
+        # (chunk, group) pairs of the step's real chunks, whose count is read
+        # from the device.
+        num_chunk_groups = tl.load(num_chunks_ptr) * ngroups
+        for pid_ch in tl.range(
+            tl.program_id(axis=1),
+            num_chunk_groups,
+            tl.num_programs(axis=1),
+            num_stages=1,
+        ):
+            _bmm_chunk_fwd_body(
+                pid_ch.to(tl.int64),
+                pid_m,
+                pid_n,
+                a_ptr,
+                b_ptr,
+                out_ptr,
+                cu_chunk_seqlens_ptr,
+                chunk_size,
+                K,
+                ngroups,
+                stride_a_seqlen,
+                stride_a_head,
+                stride_ak,
+                stride_b_seqlen,
+                stride_b_head,
+                stride_bk,
+                stride_out_chunk,
+                stride_out_head,
+                stride_outm,
+                stride_outn,
+                dot_dtype,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+            )
+    else:
+        # Static-shape launches without the chunk loop end with unused
+        # chunks, marked by a negative end boundary.
+        if (
+            HAS_PAD_CHUNKS
+            and tl.load(cu_chunk_seqlens_ptr + tl.program_id(axis=1) // ngroups + 1) < 0
+        ):
+            return
+        _bmm_chunk_fwd_body(
+            tl.program_id(axis=1).to(tl.int64),
+            pid_m,
+            pid_n,
+            a_ptr,
+            b_ptr,
+            out_ptr,
+            cu_chunk_seqlens_ptr,
+            chunk_size,
+            K,
+            ngroups,
+            stride_a_seqlen,
+            stride_a_head,
+            stride_ak,
+            stride_b_seqlen,
+            stride_b_head,
+            stride_bk,
+            stride_out_chunk,
+            stride_out_head,
+            stride_outm,
+            stride_outn,
+            dot_dtype,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+        )
 
+
+@triton.jit
+def _bmm_chunk_fwd_body(
+    pid_ch,
+    pid_m,
+    pid_n,
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    cu_chunk_seqlens_ptr,
+    # Matrix dimensions
+    chunk_size: tl.constexpr,
+    K: tl.constexpr,
+    ngroups: tl.constexpr,
+    stride_a_seqlen,
+    stride_a_head,
+    stride_ak: tl.constexpr,
+    stride_b_seqlen,
+    stride_b_head,
+    stride_bk: tl.constexpr,
+    stride_out_chunk,
+    stride_out_head,
+    stride_outm,
+    stride_outn: tl.constexpr,
+    # Meta-parameters
+    dot_dtype: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_c = pid_ch // ngroups
+    pid_h = pid_ch - pid_c * ngroups
     chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
     chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
-    # Static-shape launches end with unused chunks, marked by a negative end
-    # boundary.
-    if HAS_PAD_CHUNKS and chunk_seqlen_end < 0:
-        return
 
     a_ptr += chunk_seqlen_start * stride_a_seqlen + pid_h * stride_a_head
     b_ptr += chunk_seqlen_start * stride_b_seqlen + pid_h * stride_b_head
@@ -158,6 +257,8 @@ def _bmm_chunk_fwd(
     cu_chunk_seqlens,
     causal=False,
     output_dtype=None,
+    num_chunks=None,
+    chunk_grid=None,
     has_pad_chunks=False,
 ):
     """Argument:
@@ -167,6 +268,9 @@ def _bmm_chunk_fwd(
         cu_chunk_seq_lens: (nchunks+1,)
         causal: if True, then out[i, j] for i > j will be arbitrary, only out[i, j] for i <= j are
             guaranteed to be correct.
+        num_chunks: optional one-element int32 device tensor, the number of real
+            chunks at the front of cu_chunk_seqlens (the rest is static padding);
+            chunk_grid * ngroups programs then stride over them.
 
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
@@ -194,10 +298,11 @@ def _bmm_chunk_fwd(
             else tl.float32
         )
     )
+    grid_c = nchunks if num_chunks is None else chunk_grid
     grid = lambda META: (
         triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
         * triton.cdiv(chunk_size, META["BLOCK_SIZE_N"]),
-        nchunks * ngroups,
+        grid_c * ngroups,
     )
     launch_autotuned(
         _bmm_chunk_fwd_kernel,
@@ -207,6 +312,7 @@ def _bmm_chunk_fwd(
         b_ptr=b,
         out_ptr=out,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        num_chunks_ptr=num_chunks,
         chunk_size=chunk_size,
         K=k,
         ngroups=ngroups,
@@ -222,6 +328,7 @@ def _bmm_chunk_fwd(
         stride_outn=out.stride(-1),
         IS_CAUSAL=causal,
         dot_dtype=dot_dtype,
+        CHUNK_LOOP=num_chunks is not None,
         HAS_PAD_CHUNKS=has_pad_chunks,
     )
     return out
