@@ -225,19 +225,15 @@ def _nvfp4_kv_uses_prims_ts(
     )
 
 
-def _spec_window_left(spec: AttentionSpec) -> int:
-    sliding_window = getattr(spec, "sliding_window", None)
-    return -1 if sliding_window is None else sliding_window - 1
-
-
 def _is_sm100_nvfp4_prims_ts_spec(spec: KVCacheSpec) -> bool:
-    """Whether the spec is an NVFP4 KV cache that runs on PrimTS, on SM100
-    (where NVFP4 KV runs on trtllm-gen otherwise)."""
+    """Whether the spec is an NVFP4 KV cache that may run on PrimTS, on SM100
+    (where NVFP4 KV runs on trtllm-gen otherwise). Specs no longer carry the
+    sliding window, so a head_dim-256 spec counts as possibly sliding."""
     return (
         isinstance(spec, AttentionSpec)
         and spec.kv_quant_mode.is_nvfp4
         and current_platform.is_device_capability_family(100)
-        and _nvfp4_kv_uses_prims_ts(True, spec.head_size, _spec_window_left(spec))
+        and _nvfp4_kv_uses_prims_ts(True, spec.head_size, window_left=0)
     )
 
 
@@ -1328,8 +1324,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.nvfp4_fa2 = self.nvfp4_trtllm = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
-        # global_hyperparameters is set further down; read the window off the spec.
-        window_left = _spec_window_left(self.kv_cache_spec)
+        # The window is a layer property; global_hyperparameters is set further down.
+        window_left = infer_global_hyperparameters(
+            get_per_layer_parameters(vllm_config, layer_names, FlashInferImpl)
+        ).window_left
         self.nvfp4_fp8_context = self.nvfp4_prims_ts_decode = _nvfp4_kv_uses_prims_ts(
             self.nvfp4_trtllm, self.head_dim, window_left
         )

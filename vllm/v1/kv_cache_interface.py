@@ -991,7 +991,7 @@ class KVCacheConfig:
             spec
             for group in self.kv_cache_groups
             if not group.host_resident
-            for spec in iter_layer_specs(group.kv_cache_spec)
+            for spec in group.kv_cache_specs.values()
             if isinstance(spec, AttentionSpec)
         ]
         if not any(spec.kv_quant_mode.is_nvfp4 for spec in specs):
