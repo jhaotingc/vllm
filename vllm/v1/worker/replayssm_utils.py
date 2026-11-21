@@ -10,13 +10,13 @@ from typing import Any, NamedTuple
 import torch
 
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.ops.gdn_replayssm import (
+    gdn_replayssm_materialize,
+)
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (  # noqa: E501
     replayssm_materialize,
 )
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.third_party.flash_linear_attention.ops.gdn_replayssm import (
-    gdn_replayssm_materialize,
-)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -403,11 +403,6 @@ class _GDNReplaySSMMaterializeTables(NamedTuple):
     g_cache_slot_strides: torch.Tensor
 
 
-def _is_gdn_replayssm_mixer(mixer: Any) -> bool:
-    """GDN layers keep `[conv, ssm, u, k, g]`; Mamba2 `[conv, ssm, x, dt, B]`."""
-    return mixer.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
-
-
 @dataclass(slots=True)
 class ReplaySSMModelContext:
     """Shared replay plans with independent physical slots for each cache group."""
@@ -449,11 +444,11 @@ class ReplaySSMModelContext:
         assert all(spec == first_spec for _, spec, _ in grouped), (
             "ReplaySSM trackers require equal Mamba cache specs"
         )
-        is_gdn = _is_gdn_replayssm_mixer(first)
+        is_gdn = first.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
         geometry = [(state.shape[1:], state.dtype) for state in first.kv_cache[1:]]
         assert all(
             [(state.shape[1:], state.dtype) for state in mixer.kv_cache[1:]] == geometry
-            and _is_gdn_replayssm_mixer(mixer) == is_gdn
+            and mixer.mamba_type == first.mamba_type
             and (is_gdn or mixer.A.dtype == first.A.dtype)
             and mixer.replayssm_buffer_len == first.replayssm_buffer_len
             for mixer in mixers
@@ -476,15 +471,18 @@ class ReplaySSMModelContext:
         zero_table = torch.zeros(len(mixers), dtype=torch.int64, device=device)
         materialize_tables: _ReplaySSMMaterializeTables | _GDNReplaySSMMaterializeTables
         if is_gdn:
+            states, u_caches, k_caches, g_caches = (
+                [m.kv_cache[idx] for m in mixers] for idx in range(1, 5)
+            )
             materialize_tables = _GDNReplaySSMMaterializeTables(
-                *(
-                    table
-                    for idx in range(1, 5)
-                    for table in (
-                        _cuda_i64_ptrs([m.kv_cache[idx] for m in mixers]),
-                        _cuda_i64_slot_strides([m.kv_cache[idx] for m in mixers]),
-                    )
-                )
+                state_ptrs=_cuda_i64_ptrs(states),
+                state_slot_strides=_cuda_i64_slot_strides(states),
+                u_cache_ptrs=_cuda_i64_ptrs(u_caches),
+                u_cache_slot_strides=_cuda_i64_slot_strides(u_caches),
+                k_cache_ptrs=_cuda_i64_ptrs(k_caches),
+                k_cache_slot_strides=_cuda_i64_slot_strides(k_caches),
+                g_cache_ptrs=_cuda_i64_ptrs(g_caches),
+                g_cache_slot_strides=_cuda_i64_slot_strides(g_caches),
             )
             # u_cache is [slots, R, HV, V].
             ring_buffer_len = first.kv_cache[2].size(1)

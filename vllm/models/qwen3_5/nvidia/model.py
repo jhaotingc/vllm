@@ -184,17 +184,6 @@ def _fused_gdn_gated_rms_norm_quant(
     )
 
 
-def _uses_gdn_replayssm(vllm_config: "VllmConfig") -> bool:
-    """GDN layers keep a ReplaySSM ring with ReplaySSM speculative decoding.
-
-    Must agree with `QwenGatedDeltaNetAttention.use_replayssm`.
-    """
-    spec_config = vllm_config.speculative_config
-    return vllm_config.cache_config.use_replayssm and (
-        spec_config is not None and spec_config.num_speculative_tokens > 0
-    )
-
-
 class Qwen3_5RMSNorm(nn.Module):
     """Gemma-style RMSNorm: flashinfer kernels, or the Triton
     `gemma_add_rms_norm` below SM80 / without FlashInfer (whose norm
@@ -762,7 +751,7 @@ class Qwen3_5ForCausalLMBase(
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
-        if not _uses_gdn_replayssm(vllm_config):
+        if not vllm_config.cache_config.use_replayssm:
             return dtypes
         return MambaStateDtypeCalculator.append_gdn_replayssm_ring(dtypes)
 
@@ -787,7 +776,7 @@ class Qwen3_5ForCausalLMBase(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
-        if not _uses_gdn_replayssm(vllm_config):
+        if not vllm_config.cache_config.use_replayssm:
             return shapes
         return MambaStateShapeCalculator.append_gdn_replayssm_ring(
             shapes,
@@ -981,7 +970,7 @@ class Qwen3_5ForConditionalGeneration(
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
-        if not _uses_gdn_replayssm(vllm_config):
+        if not vllm_config.cache_config.use_replayssm:
             return dtypes
         return MambaStateDtypeCalculator.append_gdn_replayssm_ring(dtypes)
 
@@ -1006,7 +995,7 @@ class Qwen3_5ForConditionalGeneration(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
-        if not _uses_gdn_replayssm(vllm_config):
+        if not vllm_config.cache_config.use_replayssm:
             return shapes
         return MambaStateShapeCalculator.append_gdn_replayssm_ring(
             shapes,

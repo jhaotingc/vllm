@@ -483,12 +483,10 @@ def _replayssm_prefilling_rows(
     """
     if isinstance(metadata, Mamba2AttentionMetadata):
         return torch.arange(num_reqs, device="cpu") >= metadata.num_decodes
-    prefilling = torch.ones(num_reqs, dtype=torch.bool, device="cpu")
     masks = metadata.spec_sequence_masks_cpu
-    if masks is not None:
-        n = min(num_reqs, masks.numel())
-        prefilling[:n] = ~masks[:n]
-    return prefilling
+    if masks is None:
+        return torch.ones(num_reqs, dtype=torch.bool, device="cpu")
+    return ~masks[:num_reqs]
 
 
 @triton.jit

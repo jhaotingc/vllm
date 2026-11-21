@@ -7,44 +7,33 @@
 # Apache-2.0), re-addressed to vLLM's ReplaySSM ring and trackers.
 """ReplaySSM for gated delta net (GDN) speculative decoding.
 
-The baseline speculative-decode kernel stores the full ``[HV, V, K]`` recurrent state
+The baseline speculative-decode kernel stores the full `[HV, V, K]` recurrent state
 after every verified token, so the next step can resume from the last accepted one.
-ReplaySSM keeps the state at a checkpoint ``h0`` and caches, for each token since that
-checkpoint, the solved delta-rule update ``u`` (``[HV, V]``), the L2-normalized key ``k``
-(``[H, K]``) and the cumulative log-decay ``G`` from the checkpoint (``[HV]``). The state
-after the first ``n`` cached rows is
+ReplaySSM keeps the state at a checkpoint `h0` and caches, for each token since that
+checkpoint, the solved delta-rule update `u` (`[HV, V]`), the L2-normalized key `k`
+(`[H, K]`) and the cumulative log-decay `G` from the checkpoint (`[HV]`). The state
+after the first `n` cached rows is
 
     h_n = exp(G[n-1]) * h0 + sum_{j<n} exp(G[n-1] - G[j]) * k_j u_j^T,
 
-so a verify step reads ``h0`` and the short history and writes only the new rows.
+so a verify step reads `h0` and the short history and writes only the new rows.
 
-Ring and trackers follow the Mamba2 ReplaySSM contract (``replayssm_utils``): per
-physical state slot, ``ring_start`` is the oldest live row and ``num_committed`` the
-number of accepted rows since the checkpoint; rows live at ``(ring_start + j) % R`` with
-``R = B + 1 + T``. A verify step of ``q`` tokens appends its rows after the committed
-ones. If ``num_committed + q > B`` it also folds the committed rows into ``h0`` (the
-checkpoint flush) and stores its rows' ``G`` relative to the new checkpoint. The
+Ring and trackers follow the Mamba2 ReplaySSM contract (`replayssm_utils`): per
+physical state slot, `ring_start` is the oldest live row and `num_committed` the
+number of accepted rows since the checkpoint; rows live at `(ring_start + j) % R` with
+`R = B + 1 + T`. A verify step of `q` tokens appends its rows after the committed
+ones. If `num_committed + q > B` it also folds the committed rows into `h0` (the
+checkpoint flush) and stores its rows' `G` relative to the new checkpoint. The
 runner advances the trackers after rejection sampling with the same predicate.
 """
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (
+    _tl_dtype,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
-_BV16_MAX_HEAD_TILES = 64
-_BV32_MAX_HEAD_TILES = 128
-_SMALL_GRID_HEAD_TILES = 512
-_L2_STREAMING_HEAD_TILES = 8192
-
-
-def gdn_replayssm_ring_dtype(ssm_state_dtype: torch.dtype) -> torch.dtype:
-    """Dtype of the cached ``u`` and ``k`` rows (``G`` is always fp32)."""
-    return torch.float16 if ssm_state_dtype == torch.float16 else torch.bfloat16
-
-
-def _tl_dtype(dtype: torch.dtype) -> tl.dtype:
-    return getattr(tl, str(dtype).removeprefix("torch."))
 
 
 @triton.jit
@@ -70,7 +59,6 @@ def _gdn_replayssm_verify_kernel(
     slot_indices,
     cu_seqlens,
     out,
-    sum_sq,
     stride_slot_indices,
     stride_qkv_row,
     stride_b_row,
@@ -90,16 +78,14 @@ def _gdn_replayssm_verify_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     BV: tl.constexpr,
-    DOT_DTYPE: tl.constexpr,
     STATE_FP32: tl.constexpr,
-    WRITE_SUM_SQ: tl.constexpr,
-    USE_L2_STREAMING: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
-    NV: tl.constexpr = V // BV
+    # Dots run in the ring dtype: fp16 next to an fp16 state, bf16 otherwise.
+    DOT_DTYPE: tl.constexpr = u_cache.dtype.element_ty
 
     bos = tl.load(cu_seqlens + i_n).to(tl.int64)
     n_tok = tl.load(cu_seqlens + i_n + 1).to(tl.int64) - bos
@@ -111,13 +97,12 @@ def _gdn_replayssm_verify_kernel(
     o_hist = tl.arange(0, BH)
     mask_t = o_t < n_tok
     p_out = out + ((bos + o_t[:, None]) * HV + i_hv) * V + o_v[None, :]
-    p_sum_sq = sum_sq + ((bos + o_t) * HV + i_hv) * NV + i_v
 
     slot = tl.load(slot_indices + i_n * stride_slot_indices).to(tl.int64)
     if slot == PAD_SLOT_ID:
-        tl.store(p_out, tl.zeros([BT, BV], dtype=out.dtype.element_ty), mask=mask_t[:, None])
-        if WRITE_SUM_SQ:
-            tl.store(p_sum_sq, tl.zeros([BT], dtype=tl.float32), mask=mask_t)
+        tl.store(
+            p_out, tl.zeros([BT, BV], dtype=out.dtype.element_ty), mask=mask_t[:, None]
+        )
         return
 
     start = tl.load(ring_start + slot)
@@ -135,20 +120,12 @@ def _gdn_replayssm_verify_kernel(
         k_base + (hist_rows[:, None] * H + i_h) * K + o_k[None, :],
         mask=is_hist[:, None],
         other=0,
-    ).to(DOT_DTYPE)
-    if USE_L2_STREAMING:
-        b_uh = tl.load(
-            u_base + (hist_rows[:, None] * HV + i_hv) * V + o_v[None, :],
-            mask=is_hist[:, None],
-            other=0,
-            cache_modifier=".cg",
-        ).to(DOT_DTYPE)
-    else:
-        b_uh = tl.load(
-            u_base + (hist_rows[:, None] * HV + i_hv) * V + o_v[None, :],
-            mask=is_hist[:, None],
-            other=0,
-        ).to(DOT_DTYPE)
+    )
+    b_uh = tl.load(
+        u_base + (hist_rows[:, None] * HV + i_hv) * V + o_v[None, :],
+        mask=is_hist[:, None],
+        other=0,
+    )
     b_Gh = tl.load(g_base + hist_rows, mask=is_hist, other=0.0)
     g_start = tl.load(g_base + last_row, mask=committed > 0, other=0.0)
 
@@ -179,7 +156,13 @@ def _gdn_replayssm_verify_kernel(
     b_G = g_start + b_G_local
 
     # h0 tile as [K, BV] (the cache stores [HV, V, K]).
-    p_h0 = state + slot * stride_state_slot + i_hv * V * K + o_k[:, None] + o_v[None, :] * K
+    p_h0 = (
+        state
+        + slot * stride_state_slot
+        + i_hv * V * K
+        + o_k[:, None]
+        + o_v[None, :] * K
+    )
     b_h = tl.load(p_h0)
     if STATE_FP32:
         b_h_hi, b_h_lo = _split_hi_lo(b_h, DOT_DTYPE)
@@ -225,18 +208,15 @@ def _gdn_replayssm_verify_kernel(
         coeff_row = tl.sum(tl.where(row_mask[:, None], b_q_new_coeff, 0.0), axis=0)
         q_new_row = tl.sum(coeff_row[:, None] * b_U, axis=0)
         b_q_new += tl.where(row_mask[:, None], q_new_row[None, :], 0.0)
-    b_o = (tl.exp(b_G)[:, None] * b_qh0 + b_q_hist + b_q_new).to(out.dtype.element_ty)
-    tl.store(p_out, b_o, mask=mask_t[:, None])
-    if WRITE_SUM_SQ:
-        b_of = b_o.to(tl.float32)
-        tl.store(p_sum_sq, tl.sum(b_of * b_of, 1), mask=mask_t)
+    b_o = tl.exp(b_G)[:, None] * b_qh0 + b_q_hist + b_q_new
+    tl.store(p_out, b_o.to(out.dtype.element_ty), mask=mask_t[:, None])
 
     # Append this step's rows after the committed ones. After a flush they belong
     # to the new checkpoint, so their decay is local to this step.
     w_rows = ((start + committed + o_t) % R).to(tl.int64)
     tl.store(
         u_base + (w_rows[:, None] * HV + i_hv) * V + o_v[None, :],
-        b_U.to(u_cache.dtype.element_ty),
+        b_U.to(DOT_DTYPE),
         mask=mask_t[:, None],
     )
     if i_v == 0:
@@ -244,16 +224,17 @@ def _gdn_replayssm_verify_kernel(
         if i_hv % (HV // H) == 0:
             tl.store(
                 k_base + (w_rows[:, None] * H + i_h) * K + o_k[None, :],
-                b_kn.to(k_cache.dtype.element_ty),
+                b_kn,
                 mask=mask_t[:, None],
             )
 
     if flush:
         # Fold the committed rows into the checkpoint. Each program owns its
         # [K, BV] tile of h0, so the in-place store races with no reader.
-        b_Uc = b_uh.to(tl.float32) * tl.where(is_hist, tl.exp(g_start - b_Gh), 0.0)[
-            :, None
-        ]
+        b_Uc = (
+            b_uh.to(tl.float32)
+            * tl.where(is_hist, tl.exp(g_start - b_Gh), 0.0)[:, None]
+        )
         b_Uc_hi, b_Uc_lo = _split_hi_lo(b_Uc, DOT_DTYPE)
         b_kht = tl.trans(b_kh)
         b_hc = (
@@ -262,16 +243,6 @@ def _gdn_replayssm_verify_kernel(
             + tl.dot(b_kht, b_Uc_lo)
         )
         tl.store(p_h0, b_hc.to(p_h0.dtype.element_ty))
-
-
-def _default_block_v(head_tiles: int, V: int) -> int:
-    if head_tiles <= _BV16_MAX_HEAD_TILES:
-        return 16
-    if head_tiles <= _BV32_MAX_HEAD_TILES:
-        return 32
-    if head_tiles <= _SMALL_GRID_HEAD_TILES:
-        return 64
-    return V
 
 
 def gdn_replayssm_verify(
@@ -293,23 +264,30 @@ def gdn_replayssm_verify(
     max_query_len: int,
     logical_window: int,
     scale: float,
-    sum_sq: torch.Tensor | None = None,
-    block_v: int | None = None,
-    num_warps: int | None = None,
 ) -> None:
-    """Verify ``cu_seqlens.numel() - 1`` speculative rows against their checkpoints.
+    """Verify `cu_seqlens.numel() - 1` speculative rows against their checkpoints.
 
     Args:
-        mixed_qkv: ``[tokens, 2*H*K + HV*V]`` post-conv q/k/v (row stride allowed).
-        a, b: ``[tokens, HV]`` raw decay and beta gates (row strides allowed).
-        state: ``[slots, HV, V, K]`` checkpoints (fp32, bf16 or fp16).
-        u_cache, k_cache, g_cache: ``[slots, R, HV, V]``, ``[slots, R, H, K]`` and
-            ``[slots, HV, R]`` replay rings.
-        ring_start, num_committed: per-slot int32 trackers (read only).
-        slot_indices: ``[N]`` live state slot of each row (``NULL_BLOCK_ID`` skips).
-        out: ``[tokens, HV, V]`` core output before the gated RMSNorm.
-        sum_sq: optional ``[tokens, HV, V // block_v]`` per-tile sums of squares
-            of ``out`` for a fused gated-RMSNorm epilogue.
+        mixed_qkv: `[tokens, 2*H*K + HV*V]` post-conv q/k/v (row stride allowed).
+        a: `[tokens, HV]` raw decay gate (row stride allowed).
+        b: `[tokens, HV]` raw beta gate (row stride allowed).
+        A_log: `[HV]` log decay rate.
+        dt_bias: `[HV]` decay bias.
+        state: `[slots, HV, V, K]` checkpoints (fp32, bf16 or fp16), updated in
+            place on a checkpoint flush.
+        u_cache: `[slots, R, HV, V]` solved updates; its dtype is the dot dtype.
+        k_cache: `[slots, R, H, K]` normalized keys, same dtype as `u_cache`.
+        g_cache: `[slots, HV, R]` fp32 cumulative log-decay.
+        ring_start: `[slots]` int32 oldest live ring row (read only).
+        num_committed: `[slots]` int32 accepted rows since the checkpoint
+            (read only).
+        slot_indices: `[N]` live state slot of each row (`NULL_BLOCK_ID` skips).
+        cu_seqlens: `[N + 1]` token offsets of the rows.
+        out: `[tokens, HV, V]` core output before the gated RMSNorm.
+        max_query_len: tokens per row `T` (num_spec + 1, at most 8).
+        logical_window: replay history length `B` before a checkpoint flush.
+        scale: query scale.
+
     """
     num_requests = cu_seqlens.numel() - 1
     if num_requests == 0:
@@ -319,26 +297,28 @@ def gdn_replayssm_verify(
     H = k_cache.shape[-2]
     R = u_cache.shape[1]
     T = max_query_len
-    assert 1 <= T <= 8 and T <= logical_window and logical_window + T <= R
+    assert 1 <= T <= 8 and logical_window >= T and logical_window + T <= R
+    assert triton.next_power_of_2(K) == K and triton.next_power_of_2(V) == V
     assert mixed_qkv.shape[-1] == 2 * H * K + HV * V and mixed_qkv.stride(-1) == 1
-    assert a.stride(-1) == 1 and b.stride(-1) == 1
-    assert state.shape[1:] == (HV, V, K)
-    assert state.stride(3) == 1 and state.stride(2) == K and state.stride(1) == V * K
-    assert u_cache.shape[1:] == (R, HV, V) and u_cache.stride(-1) == 1
-    assert k_cache.shape[1:] == (R, H, K) and k_cache.stride(-1) == 1
-    assert g_cache.shape[1:] == (HV, R) and g_cache.dtype == torch.float32
-    assert out.is_contiguous()
-    assert K == triton.next_power_of_2(K) and V == triton.next_power_of_2(V)
+    assert a.stride(-1) == 1 and b.stride(-1) == 1 and out.is_contiguous()
+    assert state.shape[1:] == (HV, V, K) and state.stride()[1:] == (V * K, K, 1)
+    assert u_cache.shape[1:] == (R, HV, V) and u_cache.stride()[1:] == (HV * V, V, 1)
+    assert k_cache.shape[1:] == (R, H, K) and k_cache.stride()[1:] == (H * K, K, 1)
+    assert g_cache.shape[1:] == (HV, R) and g_cache.stride()[1:] == (R, 1)
+    assert u_cache.dtype == k_cache.dtype and g_cache.dtype == torch.float32
+
+    # Value-tile width measured on H200 with Qwen3.5/3.6 heads. Wider tiles win
+    # once the grid fills the GPU; fp32 states also keep a lo tile in registers.
     head_tiles = num_requests * HV
-    if block_v is None:
-        if sum_sq is not None:
-            block_v = V // sum_sq.shape[-1]
-        else:
-            block_v = _default_block_v(head_tiles, V)
-    if num_warps is None:
-        num_warps = 2 if block_v <= 32 else 4
-    if sum_sq is not None:
-        assert sum_sq.shape == (out.shape[0], HV, V // block_v)
+    state_fp32 = state.dtype == torch.float32
+    if head_tiles <= 64:
+        block_v = 32
+    elif head_tiles <= 128 or (state_fp32 and head_tiles <= 512):
+        block_v = 64
+    else:
+        block_v = V
+    block_v = min(block_v, V)
+
     _gdn_replayssm_verify_kernel[(V // block_v, head_tiles)](
         mixed_qkv,
         b,
@@ -354,7 +334,6 @@ def gdn_replayssm_verify(
         slot_indices,
         cu_seqlens,
         out,
-        out if sum_sq is None else sum_sq,
         slot_indices.stride(0),
         mixed_qkv.stride(0),
         b.stride(0),
@@ -368,24 +347,18 @@ def gdn_replayssm_verify(
         LOGICAL_WINDOW=logical_window,
         R=R,
         BT=max(triton.next_power_of_2(T), 2),
-        BH=triton.next_power_of_2(logical_window),
+        # tl.dot needs a reduction dim of at least 16.
+        BH=max(triton.next_power_of_2(logical_window), 16),
         H=H,
         HV=HV,
         K=K,
         V=V,
         BV=block_v,
-        DOT_DTYPE=_tl_dtype(gdn_replayssm_ring_dtype(state.dtype)),
-        STATE_FP32=state.dtype == torch.float32,
-        WRITE_SUM_SQ=sum_sq is not None,
-        USE_L2_STREAMING=head_tiles >= _L2_STREAMING_HEAD_TILES,
+        STATE_FP32=state_fp32,
         PAD_SLOT_ID=NULL_BLOCK_ID,
-        num_warps=num_warps,
+        num_warps=4,
         num_stages=1,
     )
-
-
-def gdn_replayssm_default_block_v(num_requests: int, num_v_heads: int, V: int) -> int:
-    return _default_block_v(num_requests * num_v_heads, V)
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -416,7 +389,7 @@ def _gdn_replayssm_materialize_kernel(
     BV: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
 ):
-    """Write ``src``'s checkpoint advanced by a ring prefix into ``dst``.
+    """Write `src`'s checkpoint advanced by a ring prefix into `dst`.
 
     One program per (active request, layer, value head x value tile).
     """
@@ -501,9 +474,9 @@ def gdn_replayssm_materialize(
     """Publish canonical prefix states for every GDN layer in one launch.
 
     The tables hold one base pointer and slot stride (in elements) per layer;
-    ``src_slots``/``dst_slots`` are ``[layers, max_num_reqs]``; the first
-    ``num_reqs`` entries of ``active_request_indices`` select requests (``-1``
-    skips); ``replay_prefix_len[req]`` rows from ``ring_start[req]`` are folded.
+    `src_slots`/`dst_slots` are `[layers, max_num_reqs]`; the first
+    `num_reqs` entries of `active_request_indices` select requests (`-1`
+    skips); `replay_prefix_len[req]` rows from `ring_start[req]` are folded.
     """
     num_layers, max_num_reqs = src_slots.shape
     if num_reqs == 0 or num_layers == 0:

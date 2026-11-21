@@ -56,6 +56,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_replayssm import gdn_replayssm_verify
 from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
     chunk_gdn_hip_fwd,
     is_hip_gdn_available,
@@ -84,12 +85,7 @@ from vllm.third_party.flash_linear_attention.ops import (
 )
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.fused_gdn_decode_post_conv_mtp import (
-    _gdn_mtp_gated_rmsnorm_kernel,
     fused_gdn_decode_post_conv_mtp_triton,
-)
-from vllm.third_party.flash_linear_attention.ops.gdn_replayssm import (
-    gdn_replayssm_default_block_v,
-    gdn_replayssm_verify,
 )
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.utils.math_utils import cdiv
@@ -740,15 +736,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # ReplaySSM: verify speculative rows from a checkpoint plus a replay
         # ring of cached (u, k, G) rows instead of storing a state per draft.
-        self.use_replayssm = (
-            vllm_config.cache_config.use_replayssm and self.num_spec > 0
-        )
+        # Config validation requires speculative decoding for GDN models.
+        self.use_replayssm = vllm_config.cache_config.use_replayssm
         self.use_replayssm_trackers = self.use_replayssm
-        self.use_flashinfer_replayssm = False
         self.replayssm_buffer_len = vllm_config.cache_config.replayssm_buffer_len
         self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
-        self._plans_replayssm_decode = False
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -2116,6 +2109,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_in_place = False
         if spec_sequence_masks is not None and self.use_replayssm:
             assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
             assert mixed_qkv_spec is not None
             spec_in_place = mixed_qkv_non_spec is None
             num_spec_tokens = mixed_qkv_spec.size(0)
@@ -2124,14 +2118,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 if spec_in_place
                 else core_attn_out.new_empty(num_spec_tokens, *core_attn_out.shape[1:])
             )
-            self._replayssm_verify(
+            num_spec_decodes = attn_metadata.num_spec_decodes
+            kv_cache = self.kv_cache
+            # Column 0 holds the live checkpoint slot. The runner advances the
+            # ring trackers after rejection sampling.
+            gdn_replayssm_verify(
                 mixed_qkv_spec,
                 a_spec,
                 b_spec,
-                spec_state_indices_tensor,
-                spec_query_start_loc,
-                attn_metadata.num_spec_decodes,
+                self.A_log,
+                self.dt_bias,
+                kv_cache[1],
+                kv_cache[2],
+                kv_cache[3],
+                kv_cache[4],
+                self._replayssm_ring_start,
+                self._replayssm_prev_num_accepted,
+                spec_state_indices_tensor[:num_spec_decodes, 0],
+                spec_query_start_loc[: num_spec_decodes + 1],
                 spec_out,
+                max_query_len=self.num_spec + 1,
+                logical_window=self.replayssm_buffer_len,
+                scale=self.head_k_dim**-0.5,
             )
             core_attn_out_spec, last_recurrent_state = spec_out.unsqueeze(0), None
         elif spec_sequence_masks is not None:
@@ -2633,7 +2641,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=state_indices[:num_requests, 0],
             num_accepted_tokens=num_accepted_tokens[:num_requests],
             query_start_loc=cu_seqlens[: num_requests + 1],
-            max_query_len=self.num_spec + 1,
+            max_query_len=state_indices.size(1),
             validate_data=False,
         )
         self._forward_core_decode_spec_post_conv_fused_norm(
@@ -2662,18 +2670,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
-        if self.use_replayssm:
-            self._replayssm_verify_fused_norm(
-                mixed_qkv,
-                a,
-                b,
-                output_gate,
-                core_attn_out,
-                state_indices,
-                cu_seqlens,
-                num_requests,
-            )
-            return
         fused_mtp_decode_impl()(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -2725,94 +2721,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
-    def _replayssm_verify(
-        self,
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        state_indices: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        num_requests: int,
-        out: torch.Tensor,
-        sum_sq: torch.Tensor | None = None,
-    ) -> None:
-        """Verify spec rows from the live checkpoint and replay ring.
-
-        The live state slot is column 0 of `state_indices`; the ring trackers
-        are advanced by the runner after rejection sampling.
-        """
-        kv_cache = self.kv_cache
-        gdn_replayssm_verify(
-            mixed_qkv,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            kv_cache[1],
-            kv_cache[2],
-            kv_cache[3],
-            kv_cache[4],
-            self._replayssm_ring_start,
-            self._replayssm_prev_num_accepted,
-            state_indices[:num_requests, 0],
-            cu_seqlens[: num_requests + 1],
-            out,
-            max_query_len=self.num_spec + 1,
-            logical_window=self.replayssm_buffer_len,
-            scale=self.head_k_dim**-0.5,
-            sum_sq=sum_sq,
-        )
-
-    def _replayssm_verify_fused_norm(
-        self,
-        mixed_qkv: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        output_gate: torch.Tensor,
-        core_attn_out: torch.Tensor,
-        state_indices: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        num_requests: int,
-    ) -> None:
-        """ReplaySSM verify followed by the gated RMSNorm epilogue."""
-        num_v_heads, head_v_dim = core_attn_out.shape[-2:]
-        block_v = gdn_replayssm_default_block_v(num_requests, num_v_heads, head_v_dim)
-        sum_sq = torch.empty(
-            (core_attn_out.size(0), num_v_heads, head_v_dim // block_v),
-            dtype=torch.float32,
-            device=core_attn_out.device,
-        )
-        self._replayssm_verify(
-            mixed_qkv,
-            a,
-            b,
-            state_indices,
-            cu_seqlens,
-            num_requests,
-            core_attn_out,
-            sum_sq,
-        )
-        _gdn_mtp_gated_rmsnorm_kernel[(num_requests, num_v_heads, self.num_spec + 1)](
-            core_attn_out,
-            sum_sq,
-            output_gate,
-            self.norm.weight,
-            cu_seqlens,
-            output_gate.stride(0),
-            self.layer_norm_epsilon,
-            HV=num_v_heads,
-            V=head_v_dim,
-            NV=head_v_dim // block_v,
-            SIGMOID_GATE=self.norm.activation == "sigmoid",
-            num_warps=2,
-        )
-
     def _can_use_fused_gdn_mtp_decode(
         self, attn_metadata: GDNAttentionMetadata
     ) -> bool:
         state_indices = attn_metadata.spec_state_indices_tensor
         return (
-            attn_metadata.spec_sequence_masks is not None
+            not self.use_replayssm
+            and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES
