@@ -138,6 +138,19 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
+    def append_gdn_replayssm_ring(
+        cls, base_dtypes: tuple[torch.dtype, ...]
+    ) -> tuple[torch.dtype, ...]:
+        """Append the GDN ReplaySSM ring dtypes to `(conv, ssm)`:
+        `(u_cache, k_cache, g_cache)`. u and k use fp16 next to an fp16 state
+        and bf16 otherwise; the cumulative log-decay g is fp32.
+        """
+        ring_dtype = (
+            torch.float16 if base_dtypes[1] == torch.float16 else torch.bfloat16
+        )
+        return (*base_dtypes, ring_dtype, ring_dtype, torch.float32)
+
+    @classmethod
     def kda_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -299,6 +312,38 @@ class MambaStateShapeCalculator:
             head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
+
+    @classmethod
+    def append_gdn_replayssm_ring(
+        cls,
+        base_shapes: tuple[tuple[int, int], tuple[int, int, int]],
+        num_k_heads: int,
+        head_k_dim: int,
+        tp_world_size: int,
+        logical_window: int,
+        num_speculative_tokens: int,
+    ) -> tuple[
+        tuple[int, int],
+        tuple[int, int, int],
+        tuple[int, int, int],
+        tuple[int, int, int],
+        tuple[int, int],
+    ]:
+        """Append the GDN ReplaySSM ring shapes to `(conv, ssm)`.
+
+        `u_cache [R, HV, V]`, `k_cache [R, H, K]` and `g_cache [HV, R]` hold
+        the solved update, normalized key and cumulative log-decay of each
+        token since the checkpoint, with `R = B + 1 + T` as for Mamba2.
+        """
+        ring_buffer_len = logical_window + 1 + num_speculative_tokens
+        local_v_heads, head_v_dim, _ = base_shapes[1]
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        return (
+            *base_shapes,
+            (ring_buffer_len, local_v_heads, head_v_dim),
+            (ring_buffer_len, local_k_heads, head_k_dim),
+            (local_v_heads, ring_buffer_len),
+        )
 
     @classmethod
     def kda_state_shape(

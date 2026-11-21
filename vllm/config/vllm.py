@@ -3799,6 +3799,33 @@ class VllmConfig:
                 "--use-replayssm is not supported for architecture "
                 f"{self.model_config.architecture!r}"
             )
+        # Gated delta net (Qwen3.5/3.6) ReplaySSM replays the speculative
+        # verify window from cached delta-rule updates; its plain decode keeps
+        # the baseline kernels, so it only exists with speculative decoding.
+        is_gdn_model = (
+            self.model_config is not None
+            and not is_kda_model
+            and getattr(
+                self.model_config.hf_text_config, "linear_num_value_heads", None
+            )
+            is not None
+        )
+        if is_gdn_model:
+            if self.num_speculative_tokens <= 0:
+                raise ValueError(
+                    "--use-replayssm for gated delta net models requires "
+                    "speculative decoding"
+                )
+            if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                raise ValueError(
+                    "--use-replayssm for gated delta net models uses its own "
+                    "Triton kernels; use --mamba-backend triton"
+                )
+            if self.num_speculative_tokens + 1 > 8:
+                raise ValueError(
+                    "GDN ReplaySSM verifies at most 8 tokens per step; got "
+                    f"num_speculative_tokens={self.num_speculative_tokens}"
+                )
         if (
             self.mamba_config.backend == MambaBackendEnum.FLASHINFER
             and self.cache_config.replayssm_buffer_len > 16
