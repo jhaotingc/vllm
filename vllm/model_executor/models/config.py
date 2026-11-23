@@ -574,12 +574,8 @@ class Gemma4Config(VerifyAndUpdateConfig):
         Gemma4 uses different head dimensions for sliding window vs full attention
         layers. The default FA3 on Hopper cannot handle head_dim > 256.
 
-        On SM90 with FP8 KV cache, use FA3 for supported layers and let the generic
-        FlashAttention selector upgrade larger head dimensions to FA4.
-        The multimodal-prefix composite routes image masks to Triton and causal
-        requests to this per-layer FA3/FA4 selection. For other configurations,
-        force FA4 for all layers to avoid the mixed
-        FA3+FA4 penalty.
+        Use FA4 for all layers by default, including SM90 with FP8 KV cache, to
+        avoid the mixed FA3+FA4 penalty.
         When FA4 is not available, fall back to Triton, or to FlashInfer for a
         plain Gemma4 with an NVFP4 KV cache, which Triton cannot read.
         """
@@ -606,22 +602,12 @@ class Gemma4Config(VerifyAndUpdateConfig):
                 and vllm_config.attention_config.backend
                 in (None, AttentionBackendEnum.FLASH_ATTN)
             ):
-                use_per_layer_fa = current_platform.is_device_capability_family(
-                    90
-                ) and vllm_config.cache_config.cache_dtype.startswith("fp8")
-                if use_per_layer_fa:
-                    logger.info(
-                        "Gemma4 model has heterogeneous head dimensions %s. Using "
-                        "per-layer FA3/FA4 selection for FP8 KV cache on SM90.",
-                        head_dims,
-                    )
-                else:
-                    vllm_config.attention_config.flash_attn_version = 4
-                    logger.info(
-                        "Gemma4 model has heterogeneous head dimensions %s. Using FA4 "
-                        "for all layers to avoid mixed FA3/FA4 penalty.",
-                        head_dims,
-                    )
+                vllm_config.attention_config.flash_attn_version = 4
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions %s. Using FA4 "
+                    "for all layers to avoid mixed FA3/FA4 penalty.",
+                    head_dims,
+                )
         elif current_platform.is_xpu():
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions %s. Leaving the "
@@ -712,19 +698,57 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
         read straight from generation_config.json at sampler-build time
         (see DiffusionGemma's custom_sampler), not injected here.
         """
-        # Inherit Gemma4's attention backend selection (FA4 on Hopper,
-        # TRITON_ATTN fallback for heterogeneous head dims).
-        Gemma4Config.verify_and_update_config(vllm_config)
-
+        from vllm.platforms import current_platform
+        from vllm.utils.flashinfer import has_flashinfer, supports_trtllm_attention
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
         attention_config = vllm_config.attention_config
-        if attention_config.backend == AttentionBackendEnum.FLASHINFER:
-            raise ValueError(
-                "FlashInfer does not support DiffusionGemma's mixed "
-                "causal/bidirectional attention. Use --attention-backend "
-                "FLASH_ATTN or TRITON_ATTN instead."
+        mm_config = vllm_config.model_config.multimodal_config
+        if (
+            attention_config.backend is None
+            and attention_config.use_trtllm_attention is not False
+            and (mm_config is None or mm_config.language_model_only)
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+            and has_flashinfer()
+            and supports_trtllm_attention(is_prefill=True)
+        ):
+            attention_config.backend = AttentionBackendEnum.FLASHINFER
+            logger.info(
+                "DiffusionGemma: defaulting to FlashInfer TRTLLM-Gen attention "
+                "for text-only serving on an SM100-family GPU."
             )
+
+        Gemma4Config.verify_and_update_config(vllm_config)
+
+        if attention_config.backend == AttentionBackendEnum.FLASHINFER:
+            from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+            if attention_config.use_trtllm_attention is False or not (
+                has_flashinfer() and supports_trtllm_attention(is_prefill=True)
+            ):
+                raise ValueError(
+                    "DiffusionGemma on FlashInfer requires the TRTLLM-Gen context "
+                    "kernel. Use --attention-backend TRITON_ATTN (or FLASH_ATTN on "
+                    "Hopper) instead."
+                )
+            if get_kv_quant_mode(vllm_config.cache_config.cache_dtype).is_nvfp4:
+                raise ValueError(
+                    "DiffusionGemma on FlashInfer does not support an NVFP4 KV "
+                    "cache yet."
+                )
+            if vllm_config.compilation_config.pass_config.fuse_attn_quant:
+                raise ValueError(
+                    "DiffusionGemma on FlashInfer does not support quantized "
+                    "attention output (fuse_attn_quant) yet."
+                )
+            if vllm_config.parallel_config.decode_context_parallel_size > 1:
+                raise ValueError(
+                    "DiffusionGemma on FlashInfer does not support decode context "
+                    "parallelism yet."
+                )
+            attention_config.use_trtllm_attention = True
+
         if attention_config.backend is None and not attention_config.use_non_causal:
             # Only the sm_100 default backend order reads this flag (it puts
             # FlashInfer first for causal models). Elsewhere Gemma4Config above
@@ -1113,6 +1137,9 @@ class GteNewModelConfig(VerifyAndUpdateConfig):
         assert config.hidden_act == "gelu"
 
         config.hidden_act = "geglu"
+
+        if getattr(config, "position_embedding_type", None) is None:
+            config.position_embedding_type = "rope"
 
         head_dim = config.hidden_size // config.num_attention_heads
         rotary_dim = getattr(config, "rotary_emb_dim", head_dim)
@@ -1952,3 +1979,22 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }
+
+
+def register_model_config(
+    architecture: str, config_cls: type[VerifyAndUpdateConfig]
+) -> None:
+    """Register the config hook of an architecture (e.g. from a plugin), as
+    `MODELS_CONFIG_MAP` does for in-tree models. Like
+    `ModelRegistry.register_model`, a later registration overwrites an earlier
+    one; replacing a different hook logs a warning."""
+    existing = MODELS_CONFIG_MAP.get(architecture)
+    if existing is not None and existing is not config_cls:
+        logger.warning(
+            "Architecture %s already has the config hook %s, and it will be "
+            "overwritten by %s.",
+            architecture,
+            existing.__name__,
+            config_cls.__name__,
+        )
+    MODELS_CONFIG_MAP[architecture] = config_cls
