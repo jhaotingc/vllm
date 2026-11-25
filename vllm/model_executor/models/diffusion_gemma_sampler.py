@@ -16,22 +16,35 @@ softcap in one pass. Each has a PyTorch reference for tests and non-CUDA
 runs. The dummy runs never take a decode step, so the model registers these
 kernels for JIT warmup with every variant serving reaches.
 
+On SM90, `flashinfer_softcap_sample_row_stats` replaces `softcap_logits`
+plus `sample_row_stats` with FlashInfer's fused kernel
+(`flashinfer.sampling.softcap_sample_with_stats`), which reads the BF16
+logits once. The Gumbel noise of `_row_stats_kernel` is drawn from that
+kernel's Philox stream, so either path samples the same tokens from the same
+logits and seed.
+
 The logprobs of a converging slot are written to a per-slot stash by
 `stash_converged_logprobs`, which skips the rows of slots that did not
 converge.
 """
 
+import functools
 import math
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import torch
 
+from vllm import envs
+from vllm.model_executor.warmup.jit_warmup import VllmJitKernel
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     DispatchSpec,
     TritonWarmupTensor,
     triton_kernel_dispatcher_with_warmup,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
+from vllm.utils.flashinfer import has_flashinfer_softcap_sample_with_stats
 
 # Allowed-set sizes covering Triton's integer specializations (1, divisible by
 # 16, other) for constrained steps, which run the sampler over K columns.
@@ -100,6 +113,36 @@ def _empty(like: Any, *shape: int, dtype: torch.dtype) -> Any:
     return torch.empty(shape, dtype=dtype, device=like.device)
 
 
+@triton.jit
+def _philox_uniform(seed, idx):
+    """Uniform for flat index `idx` (`row * V + col`) of the stream shared with
+    FlashInfer's `softcap_sample_with_stats`: word `idx & 3` of the
+    Philox4x32-10 call with key `(seed, 0)` at counter `(idx >> 2, 0, 0, 0)`,
+    so one call serves four columns."""
+    q = idx >> 2
+    c0 = (q & 0xFFFFFFFF).to(tl.uint32)
+    c1 = (q >> 32).to(tl.uint32)
+    zero = c0 * 0
+    o0, o1, o2, o3 = tl.philox(seed, c0, c1, zero, zero)
+    lane = idx & 3
+    o = tl.where(lane == 0, o0, tl.where(lane == 1, o1, tl.where(lane == 2, o2, o3)))
+    return tl.uint_to_uniform_float(o)
+
+
+@triton.jit
+def _philox_uniform_x4(seed, start, BLOCK: tl.constexpr):
+    """`_philox_uniform(seed, start + tl.arange(0, BLOCK))` for `start % 4 == 0`,
+    with one Philox call per four columns."""
+    q = (start >> 2) + tl.arange(0, BLOCK // 4)
+    c0 = (q & 0xFFFFFFFF).to(tl.uint32)
+    c1 = (q >> 32).to(tl.uint32)
+    zero = c0 * 0
+    o0, o1, o2, o3 = tl.philox(seed, c0, c1, zero, zero)
+    # Column 4k + j takes word j of call k.
+    o = tl.interleave(tl.interleave(o0, o2), tl.interleave(o1, o3))
+    return tl.uint_to_uniform_float(o)
+
+
 @triton.jit(do_not_specialize=["seed", "CL"])
 def _row_stats_kernel(
     logits_ptr,
@@ -115,6 +158,8 @@ def _row_stats_kernel(
     CL,
     WRITE_PROBS: tl.constexpr,
     BLOCK: tl.constexpr,
+    # V % 4 == 0: every block starts a Philox call (see _philox_uniform_x4).
+    RNG_X4: tl.constexpr,
 ):
     row = tl.program_id(0)
     temp = tl.load(temps_ptr + row // CL).to(tl.float32)
@@ -165,7 +210,10 @@ def _row_stats_kernel(
         best_idx = tl.where(take, start + block_idx, best_idx)
         best = tl.where(take, block_max, best)
 
-        u = tl.rand(seed, rng_base + offs)
+        if RNG_X4:
+            u = _philox_uniform_x4(seed, rng_base + start, BLOCK)
+        else:
+            u = _philox_uniform(seed, rng_base + offs)
         u = tl.maximum(u, 1e-20)
         gumbel = -tl.log(-tl.log(u))
         noisy = tl.where(mask, x * inv + gumbel * noise, float("-inf"))
@@ -227,7 +275,9 @@ def sample_row_stats(
     `logits` is `[rows, vocab]` and row `i` uses temperature
     `temps[i // canvas_len]`. A zero temperature is greedy: the sample is
     the argmax, and the entropy is the reference's, which clamps the
-    temperature at 1e-10.
+    temperature at 1e-10. The Gumbel noise of row `r`, column `c` comes from
+    `_philox_uniform(seed, r * vocab + c)`, the stream of
+    `flashinfer_softcap_sample_row_stats`.
     """
     rows, vocab = logits.shape
     argmax = _empty(logits, rows, dtype=torch.int64)
@@ -256,6 +306,7 @@ def sample_row_stats(
             CL=canvas_len,
             WRITE_PROBS=probs is not None,
             BLOCK=4096,
+            RNG_X4=vocab % 4 == 0,
             num_warps=8,
         ),
         outputs,
@@ -279,6 +330,95 @@ def sample_row_stats_reference(
     entropy = -torch.where(probs > 0, probs * log_probs, 0.0).sum(dim=-1)
     out_probs = probs.to(probs_dtype) if probs_dtype is not None else None
     return scaled.argmax(dim=-1), noisy.argmax(dim=-1), entropy, out_probs
+
+
+# The contract of flashinfer.sampling.softcap_sample_with_stats
+# (flashinfer-ai/flashinfer#9997): SM90, BF16 [rows, 262144] logits with at
+# most 65535 rows, a softcap in [2**-16, 64] and BF16 probabilities.
+_FI_SOFTCAP_SAMPLE_VOCAB = 262144
+FI_SOFTCAP_SAMPLE_MAX_ROWS = 65535
+_FI_SOFTCAP_RANGE = (2.0**-16, 64.0)
+
+
+@functools.cache
+def _flashinfer_softcap_sample_supported() -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability(90)
+        and has_flashinfer_softcap_sample_with_stats()
+    )
+
+
+def use_flashinfer_softcap_sample(
+    vocab: int, softcap: float | None, probs_dtype: torch.dtype
+) -> bool:
+    """Whether the sampler tail can run FlashInfer's fused softcap + row stats.
+
+    `VLLM_USE_FLASHINFER_SAMPLER=0` keeps `softcap_logits` + `sample_row_stats`.
+    """
+    return (
+        envs.VLLM_USE_FLASHINFER_SAMPLER
+        and softcap is not None
+        and _FI_SOFTCAP_RANGE[0] <= softcap <= _FI_SOFTCAP_RANGE[1]
+        and vocab == _FI_SOFTCAP_SAMPLE_VOCAB
+        and probs_dtype == torch.bfloat16
+        and _flashinfer_softcap_sample_supported()
+    )
+
+
+def flashinfer_softcap_sample_row_stats(
+    logits: torch.Tensor,
+    temps: torch.Tensor,
+    seed: int,
+    softcap: float,
+    probs_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """`sample_row_stats(softcap_logits(logits, softcap), ...)` in one kernel.
+
+    `logits` are the BF16 `lm_head` outputs before the softcap. FlashInfer
+    writes the BF16 probabilities on every call; they are dropped when
+    `probs_dtype` is None.
+    """
+    from flashinfer.sampling import softcap_sample_with_stats
+
+    argmax, sample, entropy, probs = softcap_sample_with_stats(
+        logits.contiguous(), temps.float().contiguous(), seed, softcap
+    )
+    return argmax, sample, entropy, probs if probs_dtype is not None else None
+
+
+class FlashInferSoftcapSampleKernel(
+    VllmJitKernel["FlashInferSoftcapSampleKernel.CompileKey"]
+):
+    """Builds FlashInfer's fused softcap + row stats kernels at startup.
+
+    FlashInfer compiles them on the first call (once per device; the row count
+    is dynamic), and the dummy runs never take a decode step.
+    """
+
+    @dataclass(frozen=True, slots=True)
+    class CompileKey:
+        device_index: int
+
+    def get_warmup_keys(self, *, vllm_config: Any) -> list[CompileKey]:
+        return [self.CompileKey(torch.accelerator.current_device_index())]
+
+    def compile(self, compile_key: CompileKey) -> None:
+        if compile_key in self._compiled_cache:
+            return
+        # 164 rows put work on the helper CTAs of a 132-SM part, so the main,
+        # helper and cold-entropy kernels are all built.
+        rows = 164
+        device = torch.device("cuda", compile_key.device_index)
+        logits = torch.zeros(
+            rows, _FI_SOFTCAP_SAMPLE_VOCAB, dtype=torch.bfloat16, device=device
+        )
+        temps = torch.ones(1, dtype=torch.float32, device=device)
+        flashinfer_softcap_sample_row_stats(logits, temps, 0, 30.0, torch.bfloat16)
+        self._compiled_cache[compile_key] = True
+
+
+FLASHINFER_SOFTCAP_SAMPLE_KERNEL = FlashInferSoftcapSampleKernel()
 
 
 @triton.jit(do_not_specialize=["W"])

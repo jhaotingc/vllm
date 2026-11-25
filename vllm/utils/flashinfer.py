@@ -821,6 +821,17 @@ def has_flashinfer_cutedsl_moe_bf16() -> bool:
 
 
 @functools.cache
+def has_flashinfer_softcap_sample_with_stats() -> bool:
+    """Return `True` if FlashInfer's experimental SM90 CuTe-DSL fused softcap
+    and sampling statistics (`flashinfer.sampling.softcap_sample_with_stats`,
+    flashinfer-ai/flashinfer#9997) is available."""
+    if not has_flashinfer_cutedsl():
+        return False
+    mod = _get_submodule("flashinfer.sampling")
+    return mod is not None and hasattr(mod, "softcap_sample_with_stats")
+
+
+@functools.cache
 def has_flashinfer_b12x_gemm() -> bool:
     """Return True if FlashInfer b12x FP4 GEMM backend is available (SM120+)."""
     if not has_flashinfer_cutedsl():

@@ -39,6 +39,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.config import DiffusionGemmaDiffusionOptions
 from vllm.model_executor.models.diffusion_gemma_sampler import (
+    FI_SOFTCAP_SAMPLE_MAX_ROWS,
+    FLASHINFER_SOFTCAP_SAMPLE_KERNEL,
+    flashinfer_softcap_sample_row_stats,
     sample_row_stats,
     sample_row_stats_reference,
     sample_step,
@@ -46,6 +49,7 @@ from vllm.model_executor.models.diffusion_gemma_sampler import (
     softcap_logits,
     stability_rows,
     stash_converged_logprobs,
+    use_flashinfer_softcap_sample,
 )
 from vllm.model_executor.models.gemma4 import Gemma4Model
 from vllm.model_executor.models.gemma4_mm import (
@@ -280,6 +284,12 @@ class DiffusionGemmaForConditionalGeneration(
                 softcap_logits.register_warmup()
             sample_row_stats.register_warmup()
             sample_step.register_warmup()
+            if use_flashinfer_softcap_sample(
+                text_config.vocab_size,
+                self.final_logit_softcapping,
+                vllm_config.model_config.dtype,
+            ):
+                FLASHINFER_SOFTCAP_SAMPLE_KERNEL.register_warmup()
 
     # ------------------------------------------------------------------ #
     # Multimodal: reuse Gemma4's image parsing, processing & embedding
@@ -351,7 +361,7 @@ class DiffusionGemmaForConditionalGeneration(
                 hidden_states, self.lm_head.weight[allowed]
             ).float()
         else:
-            logits = self.logits_processor(self.lm_head, hidden_states)
+            logits = self.compute_raw_logits(hidden_states)
         if logits is not None and self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
             if logits.is_cuda:
@@ -359,6 +369,11 @@ class DiffusionGemmaForConditionalGeneration(
             else:
                 logits = torch.tanh(logits.float() / cap) * cap
         return logits
+
+    def compute_raw_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Full-vocabulary `lm_head` logits in the model dtype, before the
+        final-logit softcap."""
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Some checkpoints carry a vestigial Gemma3n-style embedding table.
@@ -418,6 +433,14 @@ def _mask_rows_to_allowed(
         keep.index_fill_(0, allowed, True)
         out[int(start) : int(start) + int(n)].masked_fill_(~keep, _MASKED_LOGIT)
     return logits if out is None else out
+
+
+def _tail_free_memory() -> int:
+    """Device memory free for the sampler's tiles, counting what the caching
+    allocator has reserved but not handed out."""
+    free = torch.accelerator.get_memory_info()[0]
+    cached = torch.accelerator.memory_reserved() - torch.accelerator.memory_allocated()
+    return free + cached
 
 
 def _denoise_temperature(
@@ -795,6 +818,8 @@ class DiffusionGemmaModelState(ModelState):
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
             compute_logits=self.model.compute_logits,
+            compute_raw_logits=self.model.compute_raw_logits,
+            final_logit_softcapping=self.model.final_logit_softcapping,
             t_min=gen["t_min"],
             t_max=gen["t_max"],
             entropy_bound=entropy_bound,
@@ -1008,6 +1033,8 @@ class DiffusionSampler:
         diffusion_states: DiffusionGemmaRequestStates,
         *,
         compute_logits: Callable[[torch.Tensor], torch.Tensor],
+        compute_raw_logits: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        final_logit_softcapping: float | None = None,
         confidence_threshold: float,
         t_min: float,
         t_max: float,
@@ -1020,6 +1047,8 @@ class DiffusionSampler:
         tp_group_name: str = "",
     ):
         self.compute_logits = compute_logits
+        self.compute_raw_logits = compute_raw_logits
+        self.final_logit_softcapping = final_logit_softcapping
         self.sampling_states = sampler.sampling_states
         self.logprob_token_ids_state = sampler.logprob_token_ids_state
         self.req_states = sampler.req_states
@@ -1044,6 +1073,21 @@ class DiffusionSampler:
         self.vocab_size = vocab_size
         self.diffusion_states = diffusion_states
         self.entropy_bound = entropy_bound
+        # FlashInfer's fused softcap + row stats replaces softcap_logits +
+        # sample_row_stats on the tiles that do not need the softcapped logits
+        # (see `fused` in __call__). VLLM_USE_FLASHINFER_SAMPLER=0 turns it off.
+        self.fused_softcap_sample = (
+            compute_raw_logits is not None
+            and use_flashinfer_softcap_sample(
+                vocab_size, final_logit_softcapping, embed_weight.dtype
+            )
+        )
+        logger.info_once(
+            "DiffusionGemma sampler tail: %s.",
+            "FlashInfer softcap_sample_with_stats"
+            if self.fused_softcap_sample
+            else "Triton softcap_logits + sample_row_stats",
+        )
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
@@ -1557,10 +1601,13 @@ class DiffusionSampler:
         # state, so a narrow read pays for its own rows rather than the served
         # canvas. Each tile projects its own logits, and the fp32 pipeline keeps
         # several live [tile * W, vocab] copies, so a tile is also bounded by
-        # free memory.
+        # free memory. Each tile draws its own seed and numbers its own rows,
+        # so the bound counts what the caching allocator holds unused (the
+        # forward's activations, earlier tiles' temporaries) as free: the tiling
+        # then does not depend on which tail kernels earlier steps ran.
         widths_np = states.canvas_width_np[decode_slots_np]
         order = np.argsort(widths_np, kind="stable")
-        free = torch.accelerator.get_memory_info()[0] if num_decode > 0 else 0
+        free = _tail_free_memory() if num_decode > 0 else 0
         run_start = 0
         while run_start < num_decode:
             W = int(widths_np[order[run_start]])
@@ -1599,9 +1646,6 @@ class DiffusionSampler:
                     tile_hidden = hidden_states[src.reshape(-1)].masked_fill_(
                         phantom, 0
                     )
-                tile_logits = self.compute_logits(tile_hidden)
-                if allowed is not None:
-                    assert tile_logits.shape[-1] == allowed.numel()
 
                 # Per-request top_k/top_p, mirroring the AR sampler. Masked
                 # tokens become -inf and survive the temperature scaling, so
@@ -1611,8 +1655,31 @@ class DiffusionSampler:
                 top_k, top_p, has_topp_only_rows = self.sampling_states.get_top_k_top_p(
                     tile_slots.repeat_interleave(W, output_size=n * W),
                     decode_slots_np[sel_np],
-                    tile_logits.shape[-1],
+                    allowed.numel() if allowed is not None else self.vocab_size,
                 )
+                lp_np = np.flatnonzero(lp_decode_np[sel_np])
+                wide_np = np.flatnonzero(wide_decode_np[sel_np])
+                # The fused FlashInfer tail softcaps the BF16 logits itself and
+                # keeps no softcapped copy, so it takes the tiles that need
+                # none: the full vocabulary, no top_k/top_p or per-row allowed
+                # sets, and no logprobs.
+                fused = (
+                    self.fused_softcap_sample
+                    and allowed is None
+                    and per_row is None
+                    and top_k is None
+                    and top_p is None
+                    and not len(lp_np)
+                    and not len(wide_np)
+                    and n * W <= FI_SOFTCAP_SAMPLE_MAX_ROWS
+                )
+                if fused:
+                    assert self.compute_raw_logits is not None
+                    tile_logits = self.compute_raw_logits(tile_hidden)
+                else:
+                    tile_logits = self.compute_logits(tile_hidden)
+                if allowed is not None:
+                    assert tile_logits.shape[-1] == allowed.numel()
                 if top_k is not None or top_p is not None:
                     tile_logits = apply_top_k_top_p(
                         tile_logits.float(),
@@ -1644,7 +1711,18 @@ class DiffusionSampler:
                     self.t_max,
                 )
                 probs_dtype = self.embed_weight.dtype if compute_sc else None
-                if tile_logits.is_cuda:
+                if fused:
+                    assert self.final_logit_softcapping is not None
+                    seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+                    stats = flashinfer_softcap_sample_row_stats(
+                        tile_logits,
+                        temp,
+                        seed,
+                        self.final_logit_softcapping,
+                        probs_dtype,
+                    )
+                    step_fn = sample_step
+                elif tile_logits.is_cuda:
                     seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
                     stats = sample_row_stats(tile_logits, temp, W, seed, probs_dtype)
                     step_fn = sample_step
@@ -1660,8 +1738,6 @@ class DiffusionSampler:
                     argmax_rows = allowed[argmax_rows]
                     sample_rows = allowed[sample_rows]
                 probs = probs_rows.view(n, W, -1) if probs_rows is not None else None
-                lp_np = np.flatnonzero(lp_decode_np[sel_np])
-                wide_np = np.flatnonzero(wide_decode_np[sel_np])
                 if len(lp_np):
                     # Read-only slots report logprobs at temperature 1.
                     lp_temp = torch.where(states.read_only[tile_slots], 1.0, temp)
