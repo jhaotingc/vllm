@@ -62,6 +62,8 @@ class Fp8MoeBackend(Enum):
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_MOE_EP_CUTEDSL = "FLASHINFER_MOE_EP_CUTEDSL"
+    # SM90 block-FP8 CuTe-DSL routed experts (FlashInfer).
+    FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     BATCHED_DEEPGEMM = "BATCHED_DEEPGEMM"
     MARLIN = "MARLIN"
@@ -183,6 +185,13 @@ def backend_to_kernel_cls(
 
         return [FlashInferMoeEpExperts]
 
+    elif backend == Fp8MoeBackend.FLASHINFER_CUTEDSL:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_fp8_moe import (  # noqa: E501
+            FlashInferCuteDSLFp8BlockExperts,
+        )
+
+        return [FlashInferCuteDSLFp8BlockExperts]
+
     elif backend == Fp8MoeBackend.DEEPGEMM:
         from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
             TritonOrDeepGemmExperts,
@@ -297,6 +306,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
         "flashinfer_trtllm": Fp8MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": Fp8MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_moe_ep_cutedsl": Fp8MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
+        "flashinfer_cutedsl": Fp8MoeBackend.FLASHINFER_CUTEDSL,
         "marlin": Fp8MoeBackend.MARLIN,
         "humming": Fp8MoeBackend.HUMMING,
         "aiter": Fp8MoeBackend.AITER,
@@ -709,6 +719,8 @@ def convert_to_fp8_moe_kernel_format(
             Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
             Fp8MoeBackend.XPU,
             Fp8MoeBackend.HPC,
+            # Repacked by the experts' process_weights_after_loading.
+            Fp8MoeBackend.FLASHINFER_CUTEDSL,
             # EMULATION dequantizes weights at runtime; NATIVE_MXFP8 consumes
             # the MXFP8 weights as-is — neither needs a load-time layout change.
             Fp8MoeBackend.EMULATION,
